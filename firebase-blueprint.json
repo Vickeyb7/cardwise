@@ -1,0 +1,48 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile, saved credit card portfolio IDs, cap usage, and preferences",
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "description": "User full display name"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User Gmail/Google address"
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Avatar URL from Google Sign-In"
+        },
+        "ownedCardIds": {
+          "type": "array",
+          "description": "List of credit card identifiers in the user's active portfolio"
+        },
+        "capsUsedMap": {
+          "type": "object",
+          "description": "Map of card ID to monthly cashback cap utilized"
+        },
+        "theme": {
+          "type": "string",
+          "enum": ["light", "dark"],
+          "description": "Visual theme preference"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last profile update"
+        }
+      },
+      "required": ["email", "ownedCardIds"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Private user portfolio and preferences document accessible only by the authenticated owner"
+    }
+  }
+}

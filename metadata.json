@@ -1,0 +1,6 @@
+{
+  "name": "CardWise - Credit Card Rewards Optimizer",
+  "description": "Maximize credit card reward points, cashback, and monetary savings across Indian banks with real-time purchase optimization and AI policy intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
