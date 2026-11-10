@@ -55,6 +55,7 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
   // AI Assistant Drawer state
   const [aiQuestion, setAiQuestion] = useState<string>('');
   const [aiAnswer, setAiAnswer] = useState<string | null>(null);
+  const [aiCitations, setAiCitations] = useState<any[]>([]);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
   const [showAiDrawer, setShowAiDrawer] = useState<boolean>(false);
 
@@ -99,6 +100,7 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
 
     setAiLoading(true);
     setAiAnswer(null);
+    setAiCitations([]);
     setShowAiDrawer(true);
 
     try {
@@ -120,6 +122,7 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
       const data = await res.json();
       if (data.success) {
         setAiAnswer(data.answer);
+        setAiCitations(data.citations || []);
       } else {
         setAiAnswer('Unable to retrieve AI analysis at this moment. Please try again.');
       }
@@ -722,8 +725,35 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
                   </span>
                 </div>
               ) : aiAnswer ? (
-                <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 whitespace-pre-line text-xs sm:text-sm">
-                  {aiAnswer}
+                <div className="space-y-3">
+                  <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 whitespace-pre-line text-xs sm:text-sm">
+                    {aiAnswer}
+                  </div>
+                  {aiCitations.length > 0 && (
+                    <div className="p-3 rounded-xl bg-slate-100/70 dark:bg-slate-900/40 border border-slate-200/80 dark:border-slate-800 space-y-2">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                        Grounded Sources & Citations:
+                      </div>
+                      <div className="space-y-1.5">
+                        {aiCitations.map((c, idx) => (
+                          <div key={idx} className="flex items-center justify-between text-xs">
+                            <span className="text-slate-700 dark:text-slate-300 font-medium truncate pr-2">
+                              [{idx + 1}] {c.cardName} — {c.sectionTitle}
+                            </span>
+                            <a
+                              href={c.sourceUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-indigo-600 dark:text-emerald-400 hover:underline shrink-0 inline-flex items-center gap-1 font-semibold text-[11px]"
+                            >
+                              <span>Official Doc</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </a>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : null}
             </div>

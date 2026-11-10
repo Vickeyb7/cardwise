@@ -137,11 +137,13 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {/* Primary Action Button with Liquid Metal shader */}
-          <LiquidMetalButton
-            label="Optimize ₹ Spend"
-            onClick={onQuickRecommend}
-          />
+          {/* Primary Action Button with Liquid Metal shader - only shown in optimizer section */}
+          {activeTab === 'recommend' && (
+            <LiquidMetalButton
+              label="Optimize ₹ Spend"
+              onClick={onQuickRecommend}
+            />
+          )}
         </div>
       </div>
     </header>

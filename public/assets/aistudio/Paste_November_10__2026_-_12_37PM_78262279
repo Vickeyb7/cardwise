@@ -1,0 +1,1166 @@
+# CardWise Implementation Plan
+
+**Source:** [PRD.md](../PRD.md) v1.0  
+**Audience:** Engineering and product  
+**Scope:** MVP (Phase 1)  
+**Status:** Implementation definition, ready to build against
+
+This document turns the PRD into a build plan: stack, services, data model, ingestion, chunking, RAG retrieval, calculation rules, APIs, and delivery slices. Product behaviour, user-facing language, and operating rules live in [DOCUMENTATION.md](./DOCUMENTATION.md).
+
+---
+
+## 1. Decisions locked for MVP
+
+The PRD lists acceptable technologies. These choices are the ones the first build uses.
+
+| Area | Choice | Why |
+|---|---|---|
+| Mobile | React Native with Expo | One codebase for Android and iOS, fast iteration for an India-first MVP |
+| API | Python 3.12 + FastAPI | Matches the ingestion and calculation services, typed request models |
+| Primary database | PostgreSQL 16 | Structured reward rules, users, chunk text, and audit history |
+| Vector store | ChromaDB | Embeddings and similarity search live here, separate from the rules database |
+| Embeddings | Hugging Face `BAAI/bge-base-en-v1.5` via `sentence-transformers` | 768-dimension retrieval model, run locally from the Hugging Face Hub |
+| LLM | Groq | Extraction into the rule schema, and explanation text. Key: `GROQ_API_KEY` |
+| Object storage | S3-compatible bucket | Raw HTML snapshots and PDF originals |
+| Auth | Email and password, mobile OTP, and Gmail | Gmail is the fast path. Email and mobile remain available |
+| Jobs | A worker process on a queue (Redis + a Python worker) | Scheduled crawls, extraction, and reprocessing stay off the request path |
+| Environments | `local`, `staging`, `production` | Staging holds the verified card catalogue used for accuracy tests |
+
+Reward ranking is never produced by asking the model which card is best. Groq writes explanations from numbers the calculation engine already computed, and it assists extraction into a fixed schema. Hugging Face only turns text into vectors. The engine owns the numbers.
+
+---
+
+## 2. System shape
+
+```text
+┌─────────────────────┐
+│  Mobile app         │
+│  Expo / React Native│
+└──────────┬──────────┘
+           │ HTTPS JSON
+┌──────────▼──────────────────────────────────┐
+│  API (FastAPI)                              │
+│  auth · portfolio · catalogue · recommend   │
+└──────┬───────────────────────┬──────────────┘
+       │                       │
+┌──────▼──────────┐   ┌────────▼────────────────┐
+│ PostgreSQL      │   │ Worker                  │
+│ users, rules,   │   │ crawl · extract · embed │
+│ chunk text      │   │ change detect · review  │
+└──────▲──────────┘   └────────┬────────────────┘
+       │                       │
+       │              ┌────────▼────────┐
+       │              │ ChromaDB        │
+       │              │ 768-d vectors   │
+       │              └────────▲────────┘
+       │                       │
+       │              ┌────────▼────────┐
+       │              │ Official bank   │
+       └──────────────│ pages and PDFs  │
+                      └─────────────────┘
+```
+
+Chroma is a persistent store on a shared disk, opened by the API and the worker. It is not an extension inside PostgreSQL. The collection in use is `chunks__bge_base_en_v15`, cosine space. PostgreSQL does not store embedding columns.
+
+Six layers from the PRD map to these deployable pieces:
+
+| PRD layer | Runtime piece |
+|---|---|
+| Data collection | Worker crawlers, HTML fetch, PDF download |
+| Document processing | Worker extractors writing draft rules |
+| RAG knowledge base | Hugging Face embeddings, ChromaDB, retrieval in section 7 |
+| Structured reward database | PostgreSQL tables in section 4 |
+| Deterministic recommendation engine | Pure Python module called by `POST /recommendations` |
+| Mobile application | Expo app in `apps/mobile` |
+
+The recommendation request path does not crawl the web. It reads verified rules already in PostgreSQL and returns in the target of under 3 seconds.
+
+---
+
+## 3. Repository layout
+
+```text
+cardwise/
+  apps/
+    mobile/                 Expo UI. Screens, components, and API client. See section 10.
+    api/                    FastAPI service
+  services/
+    worker/                 Crawl, extract, embed, change detection
+    engine/                 Deterministic calculation package (no I/O)
+  packages/
+    schemas/                Shared pydantic models for rules and recommendations
+  docs/
+    IMPLEMENTATION.md
+    DOCUMENTATION.md
+  infra/
+    docker-compose.yml      Postgres, Redis, API, worker; Chroma files on a shared volume
+  PRD.md
+```
+
+`services/engine` imports nothing from the API or the worker. Tests feed it rule objects and a purchase and assert rupee outcomes. That is how the 98% calculation-accuracy target stays testable.
+
+---
+
+## 4. Data model
+
+Monetary amounts are integer paise. Reward rates are stored as rational numbers (`numerator` / `denominator`) or as basis points, never as bare floats in persisted rules. Display formatting happens at the API edge.
+
+### 4.1 Identity and portfolio
+
+```text
+users
+  id, email, phone, password_hash, display_name,
+  created_at, deleted_at
+
+sessions
+  id, user_id, refresh_token_hash, expires_at
+
+issuers
+  id, name, country_code          -- e.g. HDFC Bank, IN
+
+card_products
+  id, issuer_id, name, slug, network, image_url,
+  status                          -- draft | live | retired
+  summary                         -- short reward blurb for browse UI
+
+user_cards
+  id, user_id, card_product_id, nickname, added_at
+  unique (user_id, card_product_id)
+```
+
+A user stores the product they own. There is no column for PAN, CVV, expiry, or bank login.
+
+### 4.2 Sources and versions
+
+```text
+source_documents
+  id, card_product_id nullable, issuer_id,
+  doc_type,           -- card_page | rewards_page | tnc | redemption | fees
+  source_url, title
+
+document_versions
+  id, source_document_id,
+  retrieved_at, content_hash, storage_key,
+  effective_date nullable,
+  http_status, raw_text
+
+extraction_runs
+  id, document_version_id, model_name, started_at, finished_at,
+  status              -- succeeded | needs_review | failed
+```
+
+A card is `live` only when every reward rule attached to it has `verification_status = verified` and a `document_version_id`.
+
+### 4.3 Reward rules
+
+```text
+reward_rules
+  id, card_product_id, document_version_id,
+  rule_type           -- base | accelerated | merchant | exclusion | cap | threshold
+  category_code nullable
+  merchant_key nullable
+  channel             -- any | online | offline
+  earn_kind           -- points_per_spend | percent_cashback | flat_cashback
+  spend_unit_paise    -- e.g. 10000 for "per ₹100"
+  points_per_unit
+  percent_bps         -- 500 = 5.00%
+  flat_paise
+  priority            -- higher priority wins when two earn rules match
+  confidence          -- 0.00–1.00 from extraction
+  verification_status -- unverified | needs_review | verified | rejected
+  effective_from, effective_to nullable
+  last_verified_at
+
+reward_caps
+  id, reward_rule_id nullable, card_product_id,
+  scope               -- rule | category | card
+  period              -- statement | calendar_month | quarter | year | lifetime
+  max_points nullable
+  max_cashback_paise nullable
+  max_counted_spend_paise nullable
+
+redemption_values
+  id, card_product_id,
+  method              -- cashback | statement_credit | catalogue | transfer
+  paise_per_point
+  is_default
+  verification_status, document_version_id
+
+categories
+  code, display_name  -- shopping, dining, travel, grocery, fuel, utilities, other
+
+merchants
+  id, display_name, default_category_code
+
+merchant_aliases
+  merchant_id, alias  -- "amazon", "amazon.in", "amazon pay"
+```
+
+Exclusions are `reward_rules` with `rule_type = exclusion`. A matching exclusion removes earn for that slice of the purchase. Caps are applied after earn, in the engine, using `reward_caps`.
+
+MVP does not track how much of a cap the user has already consumed. The engine evaluates a single purchase and, when a cap exists, reports the cap and the benefit **for this transaction assuming the cap is still fully available**. Cap consumption across a month is Phase 2. The explanation must say that assumption in plain language.
+
+### 4.4 Recommendations (audit)
+
+```text
+recommendations
+  id, user_id, amount_paise, merchant_id nullable,
+  category_code, channel,
+  recommended_user_card_id,
+  created_at, engine_version, latency_ms
+
+recommendation_results
+  id, recommendation_id, user_card_id,
+  eligible, benefit_paise, points, cashback_paise,
+  rate_label, cap_applied, exclusion_applied,
+  rank, assumptions_json, rule_ids[]
+```
+
+This table is the source for Monthly Optimised Transactions and for accuracy reviews.
+
+### 4.5 RAG chunks
+
+Chunk text stays in PostgreSQL. The vector for that text is written to Chroma. A chunk belongs to one `document_version`. Replacing a version deletes its PostgreSQL rows and deletes the matching Chroma records (`where document_version_id`) before the new rows are inserted. Retrieval reads Chroma for nearest neighbours and PostgreSQL for the citation text and for keyword rank.
+
+```text
+document_chunks
+  id
+  document_version_id          -- FK, ON DELETE CASCADE
+  chunk_index                  -- 0-based order within the version
+  text                         -- the passage returned to the model
+  token_count
+  content_hash                 -- sha256 of text, used to skip re-embedding
+  issuer_id
+  card_product_ids uuid[]      -- empty when the page covers a whole issuer
+  doc_type                     -- card_page | rewards_page | tnc | redemption | fees
+  source_url
+  section_title                -- nearest heading, may be empty
+  page_start                   -- PDF page, null for HTML
+  page_end
+  prev_chunk_id                -- neighbour links for the expand step
+  next_chunk_id
+  tsv tsvector                 -- generated from text, for the sparse half of hybrid search
+  embedded_at                  -- set when Chroma accepted the vector
+  chroma_collection            -- collection name that holds this chunk's vector
+```
+
+PostgreSQL indexes: GIN on `tsv`, B-tree on `(issuer_id, doc_type)`, GIN on `card_product_ids`. There is no vector column and no pgvector index.
+
+Chroma holds one record per card the chunk applies to, so a filter for one card cannot return another card's copy. Issuer-wide chunks get a single record with `issuer_wide = true`.
+
+```text
+Chroma record
+  id                "{chunk_id}" or "{chunk_id}:{card_product_id}"
+  document          same string as document_chunks.text
+  embedding         float[768]
+  metadata
+    chunk_id, document_version_id, issuer_id
+    card_product_id          -- empty string when issuer-wide
+    issuer_wide              -- bool
+    doc_type, source_url, section_title
+    page_start, page_end     -- ints, omitted when null
+    chunk_index
+```
+
+Collection settings: `hnsw:space = cosine`. Metadata values are scalars, which is why card ids are one record each rather than an array. The ranker never sorts cards by Chroma distance.
+
+---
+
+## 5. Ingestion pipeline
+
+Scheduled collection is a worker job. The recommendation request never fetches a bank site.
+
+### 5.1 Source allowlist
+
+Each issuer has `services/worker/sources/<issuer>.yaml`:
+
+```yaml
+issuer: hdfc-bank
+user_agent: CardWiseBot/1.0 (+https://cardwise.example/bot)
+min_interval_seconds: 15
+entries:
+  - url: https://www.example-bank.example/cards/regalia-gold
+    doc_type: card_page
+    card_slugs: [regalia-gold]
+  - url: https://www.example-bank.example/cards/regalia-gold/terms.pdf
+    doc_type: tnc
+    card_slugs: [regalia-gold]
+```
+
+URLs in this file are the only URLs the crawler requests. Adding a page is a reviewed change to the YAML. The worker:
+
+- Reads `robots.txt` for the host and skips a URL the file disallows. The skip is recorded on the job, not retried with a different path.
+- Sends the configured user agent.
+- Waits at least `min_interval_seconds` between requests to the same host.
+- Does not log in, solve interstitials, rotate identities, or follow links that are not themselves on the allowlist. A PDF linked from an allowlisted HTML page is fetched only when that PDF URL is also an entry.
+
+### 5.2 Schedule and jobs
+
+| Job | When | Idempotency key |
+|---|---|---|
+| `crawl.source` | Nightly 02:00 IST, and on demand | `source_url + calendar date` |
+| `process.version` | After a crawl stores a new hash | `document_version_id` |
+| `extract.version` | After clean text is stored | `document_version_id + schema_version` |
+| `chunk.version` | After clean text is stored, parallel with extract | `document_version_id + chunker_version` |
+| `embed.version` | After chunks exist | `document_version_id + embedding_model` |
+| `freshness.scan` | Daily 06:00 IST | date |
+
+A job that is already `succeeded` for the same key is not run again. A failed job retries three times with backoff (1 min, 5 min, 15 min) and then sits in `failed` for an operator.
+
+### 5.3 Fetch and change detection
+
+For one allowlist entry:
+
+1. `GET` the URL with a 30-second timeout. Record HTTP status, `etag`, `last-modified`, and byte length on the job row.
+2. On status 304 or a body whose sha256 matches the latest `document_versions.content_hash` for that `source_document`, stop. No extraction, no re-embed.
+3. On 200 with a new hash, write the bytes to object storage at `raw/{issuer}/{source_document_id}/{retrieved_at}-{hash}`, insert `document_versions` (`retrieved_at`, `content_hash`, `storage_key`, `http_status`), and enqueue `process.version`.
+4. On 403, 429, or 5xx, record the status and retry under the job policy. Do not fall back to a mirror or a search-engine cache.
+5. After three failures, raise an alert. The previous verified rules stay in force.
+
+`content_hash` is the hash of the raw bytes. A second hash, `text_hash`, is computed after cleaning (section 6). If the raw hash changed but `text_hash` did not (tracking pixel, nonce in a script), the version is stored and marked `text_unchanged`. Chunk and extract jobs are skipped. This keeps layout noise from flooding the review queue.
+
+### 5.4 What a new version is allowed to change
+
+A new document version may create `reward_rules` in `unverified` or `needs_review`. It must not update a row whose `verification_status` is `verified`, and it must not set `verification_status = verified` itself.
+
+When a reviewer later verifies a replacement rule, the worker sets `effective_to` on the previous verified rule for the same card, rule type, category, merchant, and channel, and sets `effective_from` on the new row. Until that moment users keep the last verified rule. If `last_verified_at` is older than 45 days, `freshness.scan` flags the card and the API adds the stale label. The rule still calculates.
+
+---
+
+## 6. Document processing and chunking
+
+`process.version` turns a snapshot into clean text, then `chunk.version` splits that text. Extraction and chunking both read the clean text. They do not depend on each other.
+
+### 6.1 Clean HTML
+
+1. Parse with a HTML parser. Drop `script`, `style`, `noscript`, `svg`, `nav`, `footer`, cookie banners, and nodes whose class or id matches a small denylist (`nav`, `breadcrumb`, `social`, `footer`).
+2. Keep `main` or `article` when present. Otherwise keep `body`.
+3. Turn headings into lines prefixed with markdown heading markers so the chunker can see section boundaries. Turn list items into lines starting with `- `.
+4. Turn tables into markdown tables. Reward tables must survive as tables, not as loose cells.
+5. Collapse whitespace. Keep paragraph breaks.
+6. Drop runs of text that appear identically on more than half of the issuer's pages in the last 30 days (shared promo chrome). The first time an issuer is ingested this step is a no-op.
+7. Store the result as `clean/{version_id}.txt` and set `document_versions.text_hash`.
+
+### 6.2 Clean PDF
+
+1. Extract text with a PDF text extractor, page by page. Record `page_number` on every block.
+2. When a page returns almost no characters, run OCR on that page only and mark the blocks `ocr = true`. OCR text is allowed into chunks. Rules that cite only OCR text are forced to `needs_review` regardless of model confidence.
+3. Merge hyphenation at line breaks (`re-\nward` → `reward`) when the join is inside a word.
+4. Repeat the table and whitespace handling from HTML where the extractor exposes a table. Otherwise keep reading order.
+5. Drop repeating headers and footers: a line that occurs on at least 60% of pages in the same vertical band is removed, except on the first page.
+
+### 6.3 Identify cards and sections before the model runs
+
+This step is deterministic and only prepares hints for extraction. It does not write `reward_rules`.
+
+1. Load the catalogue names and aliases for the issuer (`card_products.name` plus any alias in source YAML).
+2. Scan the clean text for those names. Record the character offsets. A page whose `card_slugs` is already set in the allowlist uses that list and still records offsets when the name is found.
+3. Split the text into sections on heading lines. A section inherits the card names found inside it, else the names found in the nearest preceding section, else the allowlist slugs.
+
+The extraction prompt receives these sections one at a time when the document is longer than 12,000 tokens. Shorter documents are sent whole, with the section list still attached so quotes can be tied to a heading.
+
+### 6.4 Chunking
+
+Chunker version is a constant in code, `chunker_version`. Changing size, overlap, or split rules bumps the version and re-chunks every current document version.
+
+Parameters:
+
+| Parameter | Value |
+|---|---|
+| Target size | 800 tokens |
+| Overlap | 120 tokens |
+| Minimum size | 80 tokens (shorter fragments merge into the neighbour) |
+| Hard maximum | 1,200 tokens |
+| Table maximum | 2,000 tokens, then split by row groups |
+| Tokenizer | The Hugging Face tokenizer packaged with `BAAI/bge-base-en-v1.5` |
+
+Split order, applied to each section from section 6.3:
+
+1. If the section fits in the target size, it is one chunk.
+2. Else split on blank lines (paragraphs).
+3. Else split a paragraph on sentence boundaries.
+4. Else split on the token window: 800 tokens with 120 tokens of overlap.
+
+Rules that keep reward text intact:
+
+- A markdown table is one chunk even when it is above the target size, up to the table maximum. The header row is part of that chunk.
+- Above the table maximum, the table splits into groups of body rows. Every group chunk starts with the header row and the section title.
+- A chunk does not cross a PDF page boundary unless the break would cut a table. When neighbouring pages are joined by overlap, `page_start` and `page_end` record both pages.
+- Overlap is copied text, not a second logical section. `chunk_index` still increases by one. The overlap region lives in both chunks so a rate and its cap, often a sentence apart, land together in at least one chunk.
+- Chunks under the minimum size merge forward. The last chunk merges backward.
+
+Each chunk records `section_title`, `page_start`, `page_end`, `card_product_ids` from the section hint, `doc_type`, `source_url`, `issuer_id`, and neighbour ids. `text` is the exact string that will be embedded and later shown as a citation. No bytes are added that were not in the clean text, other than the repeated table header on a split table.
+
+### 6.5 Embedding
+
+Model: Hugging Face `BAAI/bge-base-en-v1.5`, loaded with `sentence-transformers` (`SentenceTransformer`). Output size is 768. The worker and the API load the same model id from `HUGGINGFACE_EMBEDDING_MODEL`. Weights come from the Hugging Face Hub on first use and then from the local cache. No embedding API key is required.
+
+`sentence-transformers` L2-normalises this model's vectors. Chroma is configured for cosine, so distance is `1 - cosine_similarity`.
+
+- Passages. The string embedded is `"{section_title}\n\n{text}"` when a title exists, otherwise `text`. No query instruction is added. `document_chunks.text` stays the citation body, without the title prefix.
+- Queries. Prefix the template from section 7.2 with the BGE instruction `Represent this sentence for searching relevant passages: `. Passages and queries must use the same model. Mixing the prefix onto a passage, or omitting it on a query, is a bug.
+- Encode passages in batches of 64. Skip a chunk whose `content_hash` already has `embedded_at` set for this collection.
+- Upsert into the active Chroma collection. One record per linked card product, or one issuer-wide record, as in section 4.5. Then set `embedded_at` and `chroma_collection` on the PostgreSQL row.
+- `embed.version` is `succeeded` only when every chunk for the version has `embedded_at` set and Chroma returns that chunk id.
+
+A failed batch leaves `embedded_at` null. Those chunks are excluded from retrieval. Extraction can still produce draft rules from the clean text. Citations wait until the upsert succeeds.
+
+### 6.6 Structured extraction
+
+`extract.version` runs after clean text exists. For each section produced in section 6.3:
+
+1. Build a prompt that contains the section text, the card-name hints, the closed set of `category_code` and `earn_kind` values, and the JSON schema for a rule. The instruction set says: copy numbers only from the section, every numeric field includes the source sentence in `source_quote`, use null when the section does not state the field, do not infer a rupee value for a point unless the section states one.
+2. Call Groq (`GROQ_MODEL`, default `llama-3.3-70b-versatile`) with temperature 0 and a JSON response. The client uses `GROQ_API_KEY` against Groq's OpenAI-compatible chat endpoint.
+3. Validate the payload in code:
+   - `category_code` is in the enum or null.
+   - `earn_kind` matches the fields that are filled (`percent_bps` set only for `percent_cashback`, and so on).
+   - Rates sit inside bounds: percent at or under 100%, points per ₹100 at or under 100, paise per point at or under 10,000. Outside bounds → `needs_review`, row still stored.
+   - `source_quote` is a substring of the section. A quote that cannot be found is dropped and the rule is `needs_review`. The character offsets of a found quote are stored so the UI can highlight them.
+   - Conflicting earn rules for the same card, category, merchant, and channel in one version → all of those rows `needs_review`.
+4. Set `confidence` from the validator, not from a model self-score: 0.9 when quote, bounds, and a single card match; 0.5 when the quote matched but the card hint was issuer-wide; 0.2 when the quote failed or OCR was the only source.
+5. Persist `reward_rules` with `verification_status = needs_review` when confidence is below 0.85 or any flag above fired. Otherwise `unverified`. Both states are invisible to `POST /recommendations`.
+
+Caps, exclusions, thresholds, and redemption rows use the same call and the same gates, with their own schema objects (`reward_caps`, exclusion rules, `redemption_values`).
+
+### 6.7 Human verification
+
+The internal review screen shows the draft rule, the quote highlighted inside the chunk, the source URL, and the diff against the current verified rule when one exists.
+
+The reviewer chooses `verified` or `rejected` and may edit a field before verifying. An edit records `edited_by` and the previous model value. Verification stamps `last_verified_at` and `document_version_id`. Rejection keeps the previous verified rule active.
+
+A card product flips to `live` when it has at least one verified base earn rule and one verified default redemption value (or a verified cashback rule that needs no point conversion). Until then it is `draft` and absent from search.
+
+---
+
+## 7. RAG retrieval
+
+RAG answers "what does the official document say?" inside a metadata filter. It does not answer "which card should the user pay with?" That answer is section 8, using verified rows only.
+
+Three callers share one retrieval function, `retrieve(query, filters, k)`.
+
+### 7.1 When retrieval runs
+
+| Caller | Purpose | On the user request path |
+|---|---|---|
+| Extraction audit, after section 6.6 | Pull the passages most similar to a draft rule and check the quote still sits in a top passage | No |
+| Reviewer search | A person types a question about one card while verifying | No |
+| Recommendation citation | Attach a source passage to each verified rule that affected the result | Yes, and only if the rule has no stored quote offsets |
+| Explanation | Give the model the calculated rows plus those passages so the prose can quote the source | Yes, after the engine returns |
+
+If every rule used in the result already has a `source_quote` whose offsets fall inside a chunk of the current document version, citation retrieval is skipped and those quotes are passed through. That is the common case, and it keeps the recommendation inside the latency budget.
+
+Retrieval runs on the request path only for the user's saved card products, only against document versions referenced by verified rules, and only for the rules the engine actually applied (the winning earn rule, plus an exclusion or cap if one fired). It does not scan the whole catalogue.
+
+### 7.2 Query construction
+
+The caller fills a `RetrievalQuery`. The embedded text is the BGE query instruction plus one fixed template, so the same purchase produces the same query. The instruction is applied in section 6.5 and is not repeated inside the templates below.
+
+Earn-rule citation:
+
+```text
+{card_name} {category_display} {channel} reward rate cashback points
+purchase amount context: {category_display} {channel}
+```
+
+Exclusion check during extraction audit:
+
+```text
+{card_name} exclusions not eligible {category_display} {merchant_name}
+```
+
+Cap:
+
+```text
+{card_name} monthly annual cap maximum cashback points {category_display}
+```
+
+Redemption:
+
+```text
+{card_name} reward point value redemption statement credit
+```
+
+Reviewer free text is embedded as typed, after stripping characters outside letters, digits, and spaces, truncated at 256 tokens. The card filter still applies; free text does not widen the filter.
+
+Merchant names and amounts are not required for the vector query. The amount is used only by the calculation engine. Putting the rupee amount into the embedding query pulls boilerplate that mentions that number by coincidence.
+
+### 7.3 Hard filters
+
+Dense search filters are a Chroma `where` clause passed into `collection.query`. They are predicates, not soft hints. Sparse search uses the same ids afterwards, restricted to rows already returned or to a PostgreSQL query with the same version and card constraints.
+
+```text
+$and:
+  - issuer_id = this card's issuer
+  - document_version_id $in versions referenced by verified rules
+    (or the new version id, when the caller is an extraction audit)
+  - $or:
+      - card_product_id = this card
+      - issuer_wide = true
+  - doc_type = the rule's source type    # omitted when the caller does not know it
+```
+
+A chunk stored under a different card id of the same bank fails the `where` and never enters the candidate set. Chunks with `embedded_at` null are absent from Chroma, so they cannot match. There is no cross-issuer search.
+
+### 7.4 Hybrid search and fusion
+
+Dense and sparse retrieval run inside the filter, then fuse.
+
+1. **Dense.** Encode the query with the Hugging Face model (section 6.5). Query the active Chroma collection for the top 20 ids under the `where` clause, cosine space. Convert each distance with `similarity = 1 - distance`. Record rank `d_rank` starting at 1. Map Chroma ids back to `chunk_id` and drop duplicate card-copies of the same chunk, keeping the higher similarity.
+2. **Sparse.** `plainto_tsquery` on the same query string against `tsv`. Take the top 20 by `ts_rank_cd`. Record `s_rank`. A query that produces an empty tsquery skips sparse and uses dense ranks alone.
+3. **Fusion.** Reciprocal rank fusion with `k = 60`:
+
+   `score = 1/(60 + d_rank) + 1/(60 + s_rank)`
+
+   A chunk missing from one list uses rank 21 for that list, so a dense-only hit still scores. Sort by `score` descending.
+4. **Near-duplicate drop.** Walk the fused list. Drop a chunk whose cosine similarity to an already kept chunk is above 0.95 and whose `document_version_id` is the same. This removes overlap twins from section 6.4.
+5. **Expand.** For each of the top 4 surviving chunks, if the neighbour (`prev_chunk_id` or `next_chunk_id`) shares `section_title` and is not already included, append the neighbour after the parent with `expanded = true`. Neighbours are context for the model. They do not receive their own rank.
+6. **Cut.** Return at most 5 primary chunks plus their expansions. Each item includes `chunk_id`, `text`, `source_url`, `section_title`, `page_start`, `page_end`, `score`, and `source_quote` when this call is tied to a rule that already has one.
+
+No second LLM call re-ranks the list in MVP. Fusion plus the metadata filter is the ranker for passages. Adding a cross-encoder is a later change and would have to stay inside the citation time budget in section 7.7.
+
+### 7.5 How a recommendation uses the passages
+
+`POST /recommendations` does the following in order. Steps 5 and 6 are the RAG steps. Steps 3 and 4 do the maths and do not read vectors.
+
+1. Resolve the user, load `user_cards`, and reject the call when the portfolio is empty.
+2. Resolve `merchant_name` through `merchant_aliases`. An unknown name leaves `merchant_key` empty. `category_code` from the request is kept either way.
+3. Load verified, currently effective rules, caps, and the default redemption value for those card products only.
+4. Run the calculation engine (section 8). This produces the ranked `CardResult` list, the winner, and the `rule_ids` that fired. Persist `recommendations` and `recommendation_results` now, before any model call, so a failed explanation still leaves an audit row.
+5. For each fired rule that lacks quote offsets, call `retrieve` with the matching template from section 7.2 and the hard filter for that card. Attach the top primary chunk's `text`, URL, and page to the result as `citations[]`. When quote offsets exist, attach the stored quote and URL and do not query the index.
+6. Build the explanation prompt. The only numbers in the prompt are the persisted `CardResult` fields. The only prose the model may lean on for wording is `citations[].text` and `assumptions`. Instruction: explain the winner and the lower cards; if a citation and a calculated field disagree, trust the calculated field and do not state the citation's number; do not name a card that is absent from the payload; do not change the rank. Temperature 0. Cap the call at 2 seconds. On timeout, error, or a response that mentions a rate not present in the payload, drop the prose and return the table, assumptions, and citations.
+7. Return the recommendation. `latency_ms` on the row is the time through step 4. Citation and explanation time are logged separately and are not part of the 3-second calculation target.
+
+Worked shape for a ₹10,000 online shopping query on a user who saved two cards:
+
+1. Portfolio load returns Card A and Card B.
+2. Merchant "Amazon" maps to the shopping alias or stays unknown. Category `shopping` is the one the engine uses unless a verified merchant rule matches.
+3. Verified rules load: A earns 5 points per ₹100, point value ₹0.50; B earns 3% cashback. Both channels include online. No exclusion, caps open.
+4. Engine returns B at ₹300, A at ₹250. B is rank 1. Rules used: B's percent rule, A's points rule, A's redemption row.
+5. Those three rules already store quotes, so retrieval does not run. Citations are the stored sentences and the bank URLs.
+6. The model receives both results and the three quotes and writes the explanation. The rupee figures in that sentence are ₹300 and ₹250 because those were the payload figures.
+
+If A's redemption quote were missing, step 5 would embed the redemption template, filter to A's chunks, fuse dense and sparse, and attach the best passage. The paise-per-point used in step 4 would still be the value on the verified `redemption_values` row, including when the passage disagrees. Disagreement flags the rule `needs_review` asynchronously and does not change the response already calculated.
+
+### 7.6 Extraction audit retrieval
+
+After draft rules are written, the worker runs one retrieval per draft rule:
+
+1. Query text is the rule's `source_quote` when present, otherwise the template for that rule type.
+2. Filter to the new `document_version_id` and the hinted card.
+3. The draft's quote must occur in one of the top 5 primary chunks. When it does not, set the rule to `needs_review` and store `audit_miss = true`.
+
+This catches a quote the model assembled from two distant sentences. It is another gate before a human sees a clean queue, not a path to `verified`.
+
+### 7.7 Latency and failure
+
+- Calculation (steps 1–4) target: under 3 seconds at p95 for a portfolio of 5 cards.
+- Citation retrieval, when it runs: budget 400 ms. On timeout, return the result with the source URL from the rule and an empty passage, and log `citation_degraded`.
+- Explanation budget: 2 seconds, then omit prose (section 7.5 step 6).
+- The vector query is a filtered Chroma query against the cosine HNSW index inside the collection. It is not a scan of PostgreSQL.
+- Encoding the query is a local Hugging Face forward pass, one per distinct template actually used. The model stays loaded in the API process. Calls for different fired rules run sequentially on that process so a single GPU or CPU copy is not oversubscribed.
+
+### 7.8 Reprocessing when chunking or the model changes
+
+- Bump `chunker_version`: enqueue `chunk.version` and `embed.version` for every document version that is still referenced by a verified rule or is the latest for its source. Delete that version's Chroma records, then replace its PostgreSQL chunks. Verified rules are untouched.
+- Bump the Hugging Face model id: create a new Chroma collection named for that model. Re-embed existing chunk text into it. Do not re-chunk. Switch `HUGGINGFACE_EMBEDDING_MODEL` and the active collection in the same deploy, after the new collection has a vector for every current chunk. Queries never read a collection written by a different model. Drop the previous collection once the new one is serving.
+- Bump the extraction schema: enqueue `extract.version`. New drafts do not replace verified rows (section 5.4).
+
+---
+
+## 8. Calculation engine
+
+Module: `services/engine`. Pure functions. Version string `engine_version` is stored on every recommendation. This module does not embed text, query Chroma, or call Groq.
+
+### 8.1 Input
+
+```text
+Purchase
+  amount_paise
+  category_code
+  channel            any | online | offline
+  merchant_key       optional
+
+CardContext
+  user_card_id
+  card_product_id
+  rules[]            verified, effective now
+  caps[]
+  redemption         default verified paise_per_point
+```
+
+### 8.2 Steps for one card
+
+1. Drop rules that fail channel, category, or merchant match. `channel = any` matches both. A merchant rule matches only when `merchant_key` is present and equal.
+2. If any matching exclusion covers the purchase, benefit is 0 and `exclusion_applied` is set. Stop for this card.
+3. If a matching threshold rule requires a higher amount, benefit is 0. Stop for this card.
+4. Among remaining earn rules, pick the single highest `priority`. Ties break toward the more specific match: merchant over category over base.
+5. Compute gross earn:
+   - `points_per_spend`: `points = floor(amount_paise / spend_unit_paise) * points_per_unit`
+   - `percent_cashback`: `cashback_paise = amount_paise * percent_bps / 10000`
+   - `flat_cashback`: `cashback_paise = flat_paise` when the rule matches
+6. Apply caps that match this rule, category, or card. For MVP, available headroom is the full cap (see section 4.3). If gross exceeds the cap, clamp and set `cap_applied`.
+7. Convert to paise:
+   - Cashback is already paise.
+   - Points become `points * paise_per_point` using the card's default verified redemption value.
+8. `benefit_paise` is the estimated monetary value. Rank all of the user's cards by `benefit_paise` descending. Stable tie-break: higher earn specificity, then card name.
+
+### 8.3 Output
+
+```text
+CardResult
+  eligible: bool
+  benefit_paise: int
+  points: int | null
+  cashback_paise: int | null
+  rate_label: str          -- "5% cashback" or "5 points / ₹100"
+  cap_applied: bool
+  exclusion_applied: bool
+  assumptions: str[]       -- redemption method, cap headroom, category used
+  rule_ids: str[]
+  source_urls: str[]
+```
+
+The winner is the first ranked eligible card. If every card is ineligible, the API still returns the list and a reason on each row, and does not invent a winner.
+
+### 8.4 Explanation
+
+Explanation is step 6 of the recommendation sequence in section 7.5. The API sends the structured `CardResult` list and the citations from section 7.5 to Groq. The model may only restate those figures. If the call fails, times out, or introduces a rate that is not in the payload, the API returns the table, the assumptions, and the citations without model prose. The recommendation still counts as successful.
+
+### 8.5 Worked example from the PRD
+
+Purchase ₹10,000 (`1_000_000` paise). No exclusions, caps open.
+
+| Card | Rule | Math | Benefit |
+|---|---|---|---|
+| A | 5 points per ₹100, 1 point = ₹0.50 | `floor(1000000/10000)*5 = 500` points × 50 paise | ₹250 |
+| B | 3% cashback (`percent_bps = 300`) | `1000000 * 300 / 10000 = 30000` paise | ₹300 |
+
+Card B ranks first. The explanation states the redemption assumption for Card A.
+
+---
+
+## 9. HTTP API
+
+Base path `/v1`. Authenticated routes use a bearer access token. Errors use `{ "error": { "code", "message" } }`.
+
+### Auth
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/auth/register` | Email or phone, password |
+| POST | `/v1/auth/login` | Email or phone plus password. A Gmail-only account is told to continue with Gmail |
+| POST | `/v1/auth/google` | Body `{ "id_token" }`. Verifies a Google ID token, requires a verified `@gmail.com` or `@googlemail.com` address, and returns access and refresh tokens. Creates the account when the address is new. Links to an existing email account when one is already there |
+| POST | `/v1/auth/otp/request` | Sends OTP to a verified phone transport |
+| POST | `/v1/auth/otp/verify` | Exchanges OTP for tokens |
+| POST | `/v1/auth/password/reset` | Reset flow |
+| POST | `/v1/auth/refresh` | Rotate refresh token |
+| DELETE | `/v1/me` | Account deletion |
+| GET | `/v1/me/export` | JSON export of profile, cards, recommendations |
+
+### Catalogue and portfolio
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/issuers` | Banks in the supported set |
+| GET | `/v1/cards?q=&issuer_id=` | Search by product name or bank; `live` cards only |
+| GET | `/v1/cards/{id}` | Name, image, summary, last verified date, source links |
+| GET | `/v1/me/cards` | Portfolio |
+| POST | `/v1/me/cards` | Body `{ "card_product_id", "nickname?" }` |
+| PATCH | `/v1/me/cards/{user_card_id}` | Body `{ "nickname" }`. Empty string clears it |
+| DELETE | `/v1/me/cards/{user_card_id}` | Remove from portfolio |
+
+### Recommendation
+
+`POST /v1/recommendations`
+
+```json
+{
+  "amount_rupees": "10000.00",
+  "category_code": "shopping",
+  "channel": "online",
+  "merchant_name": "Amazon"
+}
+```
+
+`amount_rupees` is a decimal string. The API converts to paise with half-up to the nearest paisa and rejects values below ₹1 or above ₹10,000,000. `category_code` is required. `merchant_name` is optional; the API resolves it through `merchant_aliases` and still uses `category_code` when the alias is unknown. Unknown merchants do not fail the request.
+
+Response includes `recommendation_id`, the ranked cards, the winner, assumptions, source URLs, `engine_version`, and optional `explanation`. Latency budget for the engine plus DB read is 3 seconds, excluding a slow explanation call, which is capped at 2 seconds and then dropped.
+
+### Internal (not in the mobile app)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/internal/review/rules?status=needs_review` | Queue for verification |
+| POST | `/internal/review/rules/{id}` | `{ "verification_status": "verified" \| "rejected" }` |
+
+Internal routes require a separate staff credential.
+
+---
+
+## 10. Frontend
+
+The product UI is the Expo app in `apps/mobile`. It is the only client for v1. Android and iOS share one codebase. Expo web is a development target so the same screens can be exercised in a browser at a centred 400-point column. There is no separate staff UI in the mobile app. Reviewers use the internal API.
+
+The device renders figures, ranks, citations, and freshness labels that the API has already computed. A polished screen is a precise presentation of that response, with clear hierarchy, restrained motion, and type that makes the rupee amount the first thing a person reads.
+
+### 10.1 Design intent
+
+CardWise should feel like a well-set paper statement, not a marketplace and not a dashboard of charts. One decision occupies the screen. Decoration never competes with the recommended card and its rupee value.
+
+Craft rules for every screen:
+
+- One primary action. It sits in the thumb zone, full width, and uses the brand fill.
+- The largest type on a screen is the number or the name the user came to see. On Result that is the benefit. On Recommend that is the amount they are about to type.
+- Colour is mostly warm paper, ink, and a deep green. A brass accent appears only on the recommended mark.
+- Surfaces are flat, with a hairline and a 1-point shadow. No glass, no gradients across whole screens, no illustration characters.
+- Motion explains a change of state. It lasts under 400 ms. It never loops.
+- Every interactive control has a pressed state, a disabled state, and a label that a screen reader can reach.
+- Indian rupee formatting, with the rupee symbol set in the same face as the digits.
+
+Reference frame is a 390 × 844 point phone. Layouts reflow from 360 to 428 wide. On web, the column is 400 points, paper background fills the viewport, and the column sits centred with the same 16-point padding.
+
+### 10.2 Stack and file layout
+
+| Piece | Choice |
+|---|---|
+| Framework | Expo SDK 52, React Native, TypeScript |
+| Navigation | Expo Router, file-based routes |
+| Server state | TanStack Query |
+| Secure session | `expo-secure-store` on device, `localStorage` only when the target is web |
+| Forms | Controlled inputs. Amounts stay strings until submit |
+| Motion | `react-native-reanimated`. Durations live in `src/motion.ts` |
+| Fonts | `@expo-google-fonts/fraunces` and `@expo-google-fonts/outfit`, loaded before first paint |
+| Icons | Local SVG stroke set in `src/icons`. No icon-font package |
+
+```text
+apps/mobile/
+  app/
+    _layout.tsx                 Root providers: query client, auth, safe area
+    index.tsx                   Welcome
+    (auth)/
+      login.tsx
+      register.tsx
+      reset.tsx
+      otp.tsx
+    (app)/
+      _layout.tsx               Bottom tabs: Recommend, Cards, Account
+      recommend.tsx
+      result.tsx
+      cards/
+        index.tsx               Portfolio
+        add.tsx                 Search and add
+        [id].tsx                Card detail
+      account.tsx
+  src/
+    api/client.ts               Fetch wrapper, token refresh, error shape
+    api/types.ts                Response types matching section 9
+    components/                 Pieces in section 10.8
+    theme.ts                    Colour, type, spacing, elevation
+    motion.ts                   Durations and easings
+    icons/                      Stroke icons for tabs and rows
+    format/money.ts             Paise to Indian rupee text
+    auth/session.tsx            Access token, refresh, sign-out
+  app.json
+  package.json
+```
+
+`EXPO_PUBLIC_API_URL` points at the FastAPI origin. The client sends `Authorization: Bearer` on every route under `(app)`. A 401 refreshes once via `POST /v1/auth/refresh`. A second 401 clears the session and shows login.
+
+### 10.3 Navigation and chrome
+
+```text
+Welcome
+  ├─ Register ─ OTP (phone only) ─ Recommend
+  ├─ Login ─ Recommend
+  └─ Reset password ─ Login
+
+Signed-in tabs
+  Recommend ─ Result
+  Cards ─ Add cards
+        └─ Card detail
+  Account
+```
+
+Unauthenticated users cannot open `(app)`. A signed-in user opening the app lands on Recommend. Hardware back from Result returns to Recommend and keeps the amount, category, channel, and merchant that were just submitted.
+
+Status bar content is dark on paper screens and light on the Result hero. The status bar background matches the surface under it.
+
+Bottom tabs sit on `card`, with a 1-point `line` along the top. Height is 56 plus the safe-area inset. The active tab uses `brand` for icon and label. Inactive tabs use `body` at 70% opacity. Icons are 24-point stroke icons, 1.5 point stroke, drawn as SVG components in `src/icons/` (Recommend: a diamond, Cards: two overlapping rectangles, Account: a circle). Labels are 11-point Outfit Medium. The tab bar hides on Result, Add cards, Card detail, and the auth stack, so those screens get a full-height layout and a text back control.
+
+| Tab | Route | Role |
+|---|---|---|
+| Recommend | `/(app)/recommend` | Ask which card to use |
+| Cards | `/(app)/cards` | Portfolio and add flow |
+| Account | `/(app)/account` | Profile, export, delete |
+
+Headers on pushed screens: 44-point bar, back chevron at least 44 by 44, title centred in Outfit Medium 16, no large collapsing header. The Recommend tab has no back button and no navigation title. Its title lives in the page content.
+
+### 10.4 Colour
+
+All colours are tokens in `src/theme.ts`. Screens use token names, never raw hex.
+
+| Token | Value | Use |
+|---|---|---|
+| `paper` | `#F3F0E8` | Screen background. Warm, slightly darker than the cards so surfaces lift |
+| `card` | `#FFFcf7` | Inputs, list rows, sheets |
+| `ink` | `#1C1915` | Titles, amounts, primary text |
+| `body` | `#5C564C` | Supporting copy |
+| `faint` | `#8A8378` | Placeholders, inactive tab labels |
+| `line` | `#E5DFD4` | Hairlines, input borders, tab-bar top edge |
+| `brand` | `#0E6B56` | Primary button, selected chip, active tab |
+| `brandPressed` | `#0A5343` | Primary button while pressed |
+| `brandWash` | `#E5F2EE` | Selected chip background when it is not a solid fill, freshness on a verified card |
+| `brandInk` | `#FFFcf7` | Type on brand fills, and type on the Result hero |
+| `hero` | `#12352C` | Result top panel. Deeper than `brand`, so the amount sits on a quiet field |
+| `brass` | `#8C6A32` | Recommended mark and the thin rule under the winner's name. Nowhere else |
+| `warn` | `#8A5A00` | Stale-data label |
+| `warnWash` | `#F8F0DE` | Background of a stale pill |
+| `danger` | `#8E1B1B` | Destructive labels and form errors |
+| `dangerWash` | `#F8E8E4` | Error field fill |
+
+Issuer plates, used when a card has no `image_url`, are flat colours plus the bank's initials in `brandInk`. They are not photographs of real cards.
+
+| Issuer | Plate |
+|---|---|
+| HDFC Bank | `#004C8F` |
+| Axis Bank | `#971237` |
+| ICICI Bank | `#B85C00` |
+| SBI Card | `#1F4E9E` |
+| American Express | `#1A1A1A` |
+| Standard Chartered | `#0E6B56` |
+| IDFC FIRST Bank | `#9A3412` |
+| IndusInd Bank | `#7A1F3D` |
+
+Contrast: `ink` on `paper` and `brandInk` on `hero` both clear 7:1. `body` on `paper` clears 4.5:1. Brass is used for a 2-point rule and a small label, always paired with `ink` text of the same meaning, so the colour is not the only signal.
+
+### 10.5 Type
+
+Two families, loaded before the first screen paints. A splash-coloured view in `paper` covers the app until `useFonts` resolves.
+
+| Role | Family | Size / line | Tracking |
+|---|---|---|---|
+| Display | Fraunces 560 | 56 / 60 | -1 |
+| Wordmark | Fraunces 560 | 40 / 44 | -0.5 |
+| Title | Fraunces 560 | 32 / 38 | -0.4 |
+| Headline | Outfit Medium 500 | 22 / 28 | -0.2 |
+| Body | Outfit Regular 400 | 16 / 24 | 0 |
+| Label | Outfit Medium 500 | 13 / 18 | 0.2 |
+| Caption | Outfit Regular 400 | 12 / 16 | 0.1 |
+| Tab | Outfit Medium 500 | 11 / 14 | 0.2 |
+
+Display and title are for the welcome wordmark, the recommend prompt, and the result amount. Everything else is Outfit. Amounts set `fontVariant: ['tabular-nums']`.
+
+`format/money.ts` turns paise into Indian grouping: `₹10,000`, or `₹10,000.50` when paise are not a whole rupee. The rupee sign is part of the string, set in Fraunces on Display and in Outfit everywhere else. The client never divides rates or rebuilds a benefit. It only formats integers the API returned.
+
+### 10.6 Spacing, shape, elevation
+
+Spacing scale: 4, 8, 12, 16, 24, 32, 48. Screen padding is 20 horizontal. Sections stack with 24 between them. Related labels and controls use 8.
+
+| Element | Radius | Elevation |
+|---|---|---|
+| Input, chip | 12 | none, 1-point `line` border |
+| List card | 16 | shadow `0 8 24` at 6% ink |
+| Primary button | 14 | none |
+| Bottom sheet | 20 on the top corners | shadow `0 -8 24` at 8% ink |
+| Result hero | 0, full bleed | none. The panel ends in a 24-point bottom radius where it meets `paper` |
+
+Tap targets are at least 44 by 44, including chips. Primary buttons are full width and 52 tall. Pressed buttons scale to 0.98 and move to `brandPressed`. Disabled buttons use `brand` at 40% opacity and ignore presses.
+
+### 10.7 Motion
+
+Durations and curves live in `src/motion.ts`.
+
+| Name | Time | Curve | Use |
+|---|---|---|---|
+| `press` | 120 ms | ease-out | Button scale, chip colour |
+| `swap` | 200 ms | ease-out | Segmented control, row expand height |
+| `enter` | 320 ms | cubic-bezier(0.2, 0.8, 0.2, 1) | Result hero and amount |
+| `settle` | 400 ms | ease-out | Display number arriving at its final value |
+
+The result amount animates from 70% of the final rupee value to the final value over `settle`, using the number already in the response. It is a presentation of a known figure. Reduced motion, from `AccessibilityInfo`, skips translation and the number ramp. Opacity fades of 120 ms remain.
+
+Screen transitions: auth and pushed screens use the platform horizontal slide. Result uses a fade plus an 8-point upward settle so the hero reads as a new surface. Tab changes are instant. No shared-element animation in v1.
+
+Haptics, via `expo-haptics`:
+
+- Selection tick when a chip changes.
+- Success notification when a recommendation returns a winner.
+- Warning notification when every card is ineligible.
+- Light impact when a card is added to the portfolio.
+
+Haptics are skipped when the system has them disabled.
+
+### 10.8 Shared components
+
+Components live in `src/components`. Each one takes content and state as props. None of them call the network.
+
+**`Screen`.** `paper` background, safe area, and a `ScrollView` that dismisses the keyboard on drag. A sticky footer slot pins the primary button above the keyboard and the home indicator, with 16 points of padding and a top hairline only when the body is scrolled. The footer is outside the scroll so the action stays visible.
+
+**`Button`.** Four roles. `primary` is `brand` fill, `brandInk` Outfit Medium 16. `secondary` is transparent with a `line` border and `ink` label. `ghost` is text-only in `brand`. `danger` is text-only in `danger` unless it is the sheet confirm, which is a full `danger` fill. While a mutation runs, the label swaps for a 20-point spinner and the control is disabled. Pressed state uses `press` from section 10.7.
+
+**`TextField`.** Label in `Label` above the field, 8 points of gap. The field is 52 tall, `card` fill, 12 radius, 1-point `line`. Focus moves the border to `brand` at 1.5 points. Error replaces the border with `danger`, fills `dangerWash`, and shows `Caption` in `danger` 4 points under the field. Password fields have a Show/Hide control inside the trailing 44-point zone.
+
+**`AmountField`.** The recommend screen's dominant control. Height 72. Fraunces 40, `ink`, tabular numbers, a `₹` prefix in Fraunces 32 `faint` until the user types, then `ink`. Numeric keyboard, decimal pad. The field strips characters other than digits and a single dot, and limits the fraction to two digits. Placeholder is `0` in `faint`. A blinking caret is the system caret. Under the field, a `Caption` in `faint` reads "Indian rupees".
+
+**`Segmented`.** Two options, used for Email/Mobile and for Online/Offline. Track is `line` at 36 tall, radius 12, padding 3. The selected pill is `card` with the list-card shadow and an `ink` label. The unselected label is `body`. The pill moves with `swap`.
+
+**`ChipRow`.** Horizontal wrap, gap 8. Unselected chip: `card`, `line` border, `body` label, height 40, horizontal padding 14. Selected chip: `brand` fill, `brandInk` label. Category chips use this. They wrap onto a second line on a 390-point width rather than scrolling, so every category is visible without a gesture.
+
+**`IssuerPlate`.** 48 by 32, radius 6. Bank colour from section 10.4, initials in Outfit Medium 11 `brandInk`, centred. When `image_url` is present, the same frame shows the image with a `line` border and no plate colour.
+
+**`CardRow`.** A `card` surface, radius 16, padding 14, shadow from section 10.6. Left: `IssuerPlate`. Centre: card name in Headline 18 (Outfit Medium 18 / 24), bank in Caption `faint`, one summary line in Body 14/20 truncated to two lines. Right: the action. Rows are separated by 12 points, not by dividers. Pressed state darkens the surface by mixing 4% `ink`.
+
+**`BenefitRow`.** Padding 16. Name in Outfit Medium 16. Benefit in Outfit Medium 16 tabular, aligned trailing. Rate in Caption `body` on a second line. Ineligible rows keep the name and replace the benefit with "₹0", and put the reason ("Excluded", "Below minimum", "No matching reward") in Caption `body`. The winning row has a 2-point `brass` rule above the name and a Caption in `brass` reading "Recommended". Expanding the row uses `swap` on height and reveals points or cashback, assumptions for that card, `Freshness`, and a Source text button.
+
+**`Freshness`.** A pill, height 24, horizontal padding 8, radius 999. Verified: `brandWash` background, `brand` Caption, "Verified 12 Mar 2026". Stale (API flag, last verified older than 45 days): `warnWash` background, `warn` Caption, "Verified 12 Jan 2026 · needs a check". The date format is `d MMM yyyy` in the device locale, with a fixed English month abbreviation so the pill width stays stable.
+
+**`EmptyState`.** Vertically centred in the space above the tab bar. A 40-point brass rule, 32 points wide, centred. Title in Title (Fraunces 32). One sentence in Body `body`, max width 280, centred. One `primary` button, not full width, min width 200, centred, 24 points below the sentence.
+
+**`Sheet`.** Modal bottom sheet for destructive confirms. Scrim is `ink` at 40%. The sheet uses the shape in section 10.6. Title in Headline, body in Body, then a row of two buttons: `secondary` Cancel, and the confirm. Dragging down or tapping the scrim dismisses when the action is not in flight.
+
+**`Skeleton`.** `line` blocks with a 1.2-second opacity pulse between 0.5 and 1. Radius matches the content they stand in for. Reduced motion holds them at 0.7 opacity with no pulse.
+
+**`ErrorBanner`.** Sits in the footer above the button, or under a list. `dangerWash` fill, radius 12, padding 12. `error.message` in Body `danger`. A `ghost` Retry appears for network failures and HTTP 5xx.
+
+### 10.9 Screens
+
+**Welcome** (`app/index.tsx`)
+
+The screen is mostly paper, with the content set in the lower half so the wordmark has air.
+
+- Top 18% of the screen is empty paper.
+- A 32-by-2 `brass` rule.
+- 16 points below it, the wordmark "CardWise" in Wordmark (Fraunces 40).
+- 8 points below, Body `body`: "Use the card that pays you more."
+- 48 points below, a footer stack: `primary` "Create account", then `secondary` "Continue with Gmail" (a G monogram and the label), then `secondary` "Sign in", then a `ghost` "Forgot password" centred.
+
+No carousel, no bank logos, no reward percentages. The first screen is an invitation, not a catalogue.
+
+**Register** (`app/(auth)/register.tsx`)
+
+Header title "Create account". Content, top to bottom, gap 16:
+
+- `Segmented`: Email, Mobile. Email is the initial selection.
+- `TextField` display name, optional, hint Caption "Shown on your account".
+- `TextField` email, keyboard `email-address`, or mobile with `phone-pad` and a fixed `+91` prefix in `body` inside the field. The prefix is not part of the submitted national number. The client sends E.164 `+91` plus the ten digits.
+- `TextField` password, secure, hint "At least 8 characters".
+- Footer `primary` "Create account".
+- Above that button, `secondary` "Continue with Gmail".
+
+`POST /v1/auth/register`. Email success stores tokens and replaces the stack with Recommend. Mobile success pushes OTP with the phone in params. Duplicate contact and a short password render in the field's error slot. The button stays disabled until the contact field matches its pattern and the password is at least 8 characters.
+
+**OTP** (`app/(auth)/otp.tsx`)
+
+Header "Enter the code". Body: "Sent to +91 •••• 1234" with all but the last four digits masked. Six separate 48-point boxes, gap 8, Fraunces 24, one digit each. Focus advances on input and retreats on delete. Paste of six digits fills all boxes. The keyboard is numeric and opens on mount. Footer `primary` "Verify" calls `POST /v1/auth/otp/verify`. Under it, a `ghost` "Resend code" is disabled for 30 seconds and shows the remaining seconds in the label ("Resend in 18s"). Resend calls `POST /v1/auth/otp/request`. A wrong code shakes the row 6 points, three cycles over 280 ms, sets the error "That code does not match", and clears the boxes. Success stores tokens and replaces the stack with Recommend.
+
+**Login** (`app/(auth)/login.tsx`)
+
+Header "Sign in". The same Email/Mobile `Segmented` as register. Password field. `secondary` "Continue with Gmail" sits above the footer. Footer `primary` "Sign in" → `POST /v1/auth/login`. Below the footer button, two `ghost` links stacked: "Use a one-time code" (mobile segment only, requests an OTP) and "Forgot password".
+
+**Continue with Gmail**
+
+The control is on Welcome, Register, and Login. It opens the API at `GET /v1/auth/google/start`. The app does not embed a Google client id. When `GOOGLE_CLIENT_ID` is set, the API sends the person to Google. The authorized redirect URI is `{PUBLIC_API_URL}/v1/auth/google/callback` (default `http://127.0.0.1:8000/v1/auth/google/callback`). Google returns the ID token to that callback. The API checks it, then sends the person back to the app already signed in. On a local machine with no client id, the same button asks for the Gmail address and signs that account in.
+
+The API checks the token with Google, checks `aud` against `GOOGLE_CLIENT_ID`, and accepts only a verified `@gmail.com` or `@googlemail.com` address. A new address creates an account with `auth_provider = google` and the name from the Google profile. An address that already has a CardWise account receives tokens for that account. A Gmail-only account that tries the password form sees "This account uses Gmail. Continue with Gmail."
+
+**Reset** (`app/(auth)/reset.tsx`)
+
+Header "Reset password". One contact field, following the segmented choice. `primary` "Send reset instructions" → `POST /v1/auth/password/reset`. On success the form is replaced in place by a confirmation: brass rule, Title "Check your messages", Body "We sent the next step to the address you entered." A `secondary` "Back to sign in" sits in the footer. The reset token is never rendered.
+
+**Recommend** (`app/(app)/recommend.tsx`)
+
+This is the home screen, and the composition puts the amount first.
+
+1. 12 points below the safe area, Caption `faint` in small caps tracking 1.2: "A PURCHASE".
+2. Title, Fraunces 32: "Which card should you use?"
+3. 24 points, then `AmountField`. Focus opens the decimal pad when the screen gains focus and the portfolio is not empty.
+4. 24 points, Label "Category", 8 points, `ChipRow`. Shopping is selected on first visit. The selection is remembered for the session.
+5. 24 points, Label "Where", 8 points, `Segmented` Online / Offline. Online is initial.
+6. 24 points, `TextField` "Merchant", optional, placeholder "Amazon, Swiggy, a restaurant". Caption under it: "Optional. Category is used when the name is unknown."
+7. Footer `primary` "Find the best card".
+
+Submit calls `POST /v1/recommendations` with `amount_rupees` as a decimal string, `category_code`, `channel` (`online` or `offline`), and `merchant_name` omitted when blank. Amount missing, below ₹1, or above ₹1,00,00,000 shows the field error "Enter an amount from ₹1 to ₹1 crore" and does not call the network. The button label switches to "Finding the best card" with a spinner. Fields stay visible and inert. Success writes the response into the query cache under `["recommendation", id]` and pushes Result. Failure shows `ErrorBanner` in the footer and leaves the user here.
+
+Empty portfolio: the form is not rendered. `EmptyState` title "Add a card you already own", sentence "Recommendations compare only the cards you add.", button "Add a card" → Add cards.
+
+**Result** (`app/(app)/result.tsx`)
+
+This is the signature screen. The top 46% is a `hero` panel, full bleed, including the status bar. Bottom radius 24. Content inset 20, laid out from the top of the safe area:
+
+- A back chevron in `brandInk`, 44-point target, and Caption `brandInk` at 80% opacity: "FOR ₹10,000 · SHOPPING · ONLINE". The purchase context is echoed so the amount below is unambiguous.
+- 24 points below, Caption in `brass`: "RECOMMENDED" with tracking 1.4. Hidden when there is no winner.
+- Card name in Outfit Medium 22, `brandInk`.
+- Bank name in Caption, `brandInk` at 75% opacity.
+- The benefit in Display (Fraunces 56), `brandInk`, settling as in section 10.7. Example: `₹500`.
+- 8 points below, Body `brandInk` at 90%: "₹200 more than Axis Atlas" when a second eligible card exists. The delta is `winner.benefit_paise - second.benefit_paise`, formatted. It is omitted when there is no second eligible card.
+
+The panel does not include a stock photo or a fake card render.
+
+Below the hero, on `paper`, padding 20:
+
+- Explanation, Body `ink`, if the API sent `explanation`. A null explanation leaves this block out. The comparison still shows. Max six lines, then "Read more" expands in place.
+- Assumptions, each on its own line, Caption `body`, a 4-point gap. When `cap_applied` is true, one line is the API assumption that the cap is treated as fully available.
+- 24 points, Label "Compared". Then a stack of `BenefitRow`, gap 12. The winner is first and already marked. Tapping a row expands it. A second tap, or tapping another row, collapses the open one.
+- The expanded winner shows `Freshness` and Source, which opens `source_url` through `expo-web-browser` as an in-app browser sheet, not a raw OS jump with no return path.
+- Footer `secondary` "Check another purchase" pops to Recommend and restores the draft.
+
+No winner: the hero stays `hero` so the screen does not flash to an error red. The brass caption becomes "NO REWARD ON THIS PURCHASE". The Display line is `₹0`. The sentence underneath is "None of your cards earn on this category." Rows still list each card and its reason. Haptic is the warning notification.
+
+**Cards** (`app/(app)/cards/index.tsx`)
+
+- Header row in the page, not the navigation bar: Title "Your cards" at the left, Caption `faint` "{n} saved" under it, and a `ghost` "Add" at the right, 44-point target.
+- 16 points below, the list of `CardRow`. Each row shows plate or image, name, bank, summary, and `Freshness` under the summary. The trailing control is a chevron in `faint`.
+- Pull to refresh uses the platform control tinted `brand` and refetches `GET /v1/me/cards`.
+- Tap opens card detail. Empty state: `EmptyState` "Add the cards you already carry", "Search by bank or card name.", button "Add a card".
+
+**Add cards** (`app/(app)/cards/add.tsx`)
+
+Pushed screen, header "Add a card". The search field is pinned under the header. It is a `TextField` with a leading magnifying-glass icon and a clear button once text is present. Queries are debounced 300 ms to `GET /v1/cards?q=`.
+
+Under the field, issuer chips scroll horizontally, bleed to the screen edges with 20 points of leading inset, while the search field stays padded. "All banks" is first and selected. Selecting a bank sets `issuer_id` and keeps the query. The selected chip uses the brand fill. Chips are 36 tall.
+
+Results are `CardRow`s. The trailing action is a 32-point circular `brand` button with a plus icon. Cards already in the portfolio replace the plus with a check in `brandWash` and the control does not fire. `POST /v1/me/cards` runs optimistically: the plus becomes the check immediately, and reverts with `ErrorBanner` if the call fails. A duplicate response settles on the check and a Caption "Already in your cards" under that row for 2 seconds.
+
+The first visit, with an empty query, shows a Caption "Popular cards" and the first page of `GET /v1/cards` with no `q`. An empty match shows `EmptyState` without a button: "No card matches that name." Loading replaces the list with three `Skeleton` rows shaped like `CardRow`.
+
+**Card detail** (`app/(app)/cards/[id].tsx`)
+
+A quiet product page.
+
+- A 200-point header band in the issuer plate colour, full bleed. Centred in it, the card image at 240 by 152, radius 12, or a larger `IssuerPlate` at that size with the card name in `brandInk`.
+- The sheet of content overlaps the band by 24 points: a `card` surface with top radius 24, padding 20.
+- Name in Title (Fraunces 32), bank and network in Caption `faint` on one line.
+- Summary in Body, 16 points below.
+- Label "Rewards", then wrapping chips in `brandWash` / `brand` for the main categories. These chips are not selectable.
+- `Freshness`, then each source as a row: document title, a trailing external-link icon, opening the in-app browser.
+- `TextField` "Nickname", optional. Saving is automatic 600 ms after the last keystroke via the portfolio update, with a Caption "Saved" that fades in at the trailing edge. There is no separate save button.
+- 32 points below, `danger` ghost "Remove from my cards". The sheet title is "Remove {name}?", body "This only takes it out of CardWise. The card stays open at the bank.", confirm "Remove". `DELETE /v1/me/cards/{user_card_id}` then pops to the portfolio. The row is gone.
+
+**Account** (`app/(app)/account.tsx`)
+
+- Title "Account".
+- A `card` group, radius 16. First row: display name in Headline, masked contact in Caption (`a•••@domain.com`, or `+91 •••• 1234`).
+- Grouped rows, 56 tall, hairline between them, label left, chevron right: "Export my data", "Sign out".
+- Export calls `GET /v1/me/export` and opens the system share sheet with `cardwise-export.json`. While it runs, the row shows a spinner in place of the chevron.
+- Sign out clears secure storage, drops the query cache, and resets the navigation stack to Welcome.
+- 32 points below the group, a standalone `danger` row "Delete account". The sheet explains that portfolio and recommendation history are removed, asks the user to type `DELETE` into a `TextField`, and enables the confirm button only when the field matches. `DELETE /v1/me` then goes to Welcome.
+- Footer Caption `faint`, centred: "CardWise {version}".
+
+### 10.10 Voice
+
+Sentences are short and concrete. Buttons name the outcome ("Find the best card", "Add a card", "Remove"). Errors say what to do next. The product never claims a reward is guaranteed by the bank. The result amount is labelled by the assumptions under it. Exclamation marks are not used. The word "AI" does not appear in the interface. Citations are labelled "Source".
+
+### 10.11 Accessibility
+
+- Dynamic type: body, labels, and buttons scale with the system text size up to 1.4×. Display on the hero scales up to 1.2× and may wrap to two lines (`₹` on the first, digits on the second) rather than truncate.
+- Every control has an accessibility label. The amount field's label is "Purchase amount in rupees". A benefit row's label is "{card}, {amount}, {rate}".
+- Focus order follows the visual order. The result hero's back control is first.
+- Colour is never the only state. Selected chips also change weight to Medium. The recommended row has the text "Recommended", not only the brass rule.
+- Touch targets remain 44 points at the largest text size, wrapping labels inside the control.
+- `AccessibilityInfo` reduced motion is honoured as in section 10.7.
+
+### 10.12 States
+
+| State | What the user sees |
+|---|---|
+| Loading | `Skeleton` rows shaped like the content, or a spinner inside the button that triggered the call. Titles stay |
+| Empty | `EmptyState` with one next action |
+| Field error | The field takes `danger` border and `dangerWash`, and the message sits under it |
+| Request error | `ErrorBanner` with `error.message` and Retry on network or 5xx |
+| Offline | Banner "You are offline." Recommend keeps the draft and does not show a winner |
+| Stale card | `Freshness` in the warn treatment. The benefit still renders |
+| Explanation absent | Result shows the hero, the delta, and the rows. It does not poll for prose |
+
+Recommendation responses are kept in memory for the session so Result can reopen from the back stack. They are discarded on sign-out and on the next cold start. Portfolio data is cached for the session and refetched when the Cards tab gains focus.
+
+### 10.13 What the interface refuses to collect
+
+Request bodies from the client contain only the fields in section 9. Card forms drop keys matching `pan`, `card_number`, `cvv`, `cvc`, `pin`, or `expiry`. Account password fields on the auth screens are the exception. Pasting a 13–19 digit run into Merchant or nickname is rejected with "Enter a card name, not a card number." The clipboard is not read except by the user's own paste into a field.
+
+### 10.14 Screen-to-API map
+
+| Screen | Reads | Writes |
+|---|---|---|
+| Welcome | — | `POST /v1/auth/google` |
+| Register | — | `POST /v1/auth/register`, `POST /v1/auth/google` |
+| OTP | — | `POST /v1/auth/otp/request`, `POST /v1/auth/otp/verify` |
+| Login | — | `POST /v1/auth/login`, `POST /v1/auth/google` |
+| Reset | — | `POST /v1/auth/password/reset` |
+| Recommend | `GET /v1/me/cards` (empty check) | `POST /v1/recommendations` |
+| Result | The recommendation already in the query cache | — |
+| Portfolio | `GET /v1/me/cards` | — |
+| Add cards | `GET /v1/issuers`, `GET /v1/cards` | `POST /v1/me/cards` |
+| Card detail | `GET /v1/cards/{id}` | Portfolio nickname update, `DELETE /v1/me/cards/{user_card_id}` |
+| Account | Session profile | `GET /v1/me/export`, `DELETE /v1/me` |
+
+---
+
+## 11. MVP catalogue
+
+Seed issuers from the PRD: HDFC Bank, Axis Bank, ICICI Bank, SBI Card, American Express, Standard Chartered, IDFC FIRST Bank, IndusInd Bank.
+
+Launch set is 12 card products, two or three from the largest issuers, chosen because their public reward pages are stable enough to verify by hand. Exact product list is a data change in `issuers` and `card_products`, not a code change. A card ships only after one full extraction-and-review cycle. The app browse list is whatever is `live`, so the catalogue can grow without a release.
+
+Categories in MVP: `shopping`, `dining`, `travel`, `grocery`, `fuel`, `utilities`, `other`.
+
+---
+
+## 12. Security
+
+- TLS everywhere. PostgreSQL and the Chroma directory are encrypted at rest via the host disk encryption. Chroma is not reachable except through the API and the worker. It has no public port.
+- Passwords hashed with Argon2. OTPs are single use, 5-minute TTL, rate limited.
+- Access tokens are short lived (15 minutes). Refresh tokens are rotated and stored hashed.
+- Staff review tools are on a separate auth realm.
+- Logs omit phone numbers and email where a user id is enough. Raw bank HTML is stored in the bucket, not in application logs.
+- No fields exist for card number, CVV, PIN, expiry, or bank password. Request validation rejects body keys named like those if a client sends them.
+- Account delete removes `users`, `user_cards`, sessions, and recommendation rows for that user. Catalogue data stays.
+
+---
+
+## 13. Delivery slices
+
+Each slice is shippable to staging. Mobile and API land together when the slice has a user-visible behaviour.
+
+| Slice | Outcome | Done when |
+|---|---|---|
+| 0. Foundations | Compose stack, migrations, health check, CI running engine tests | `docker compose up` serves `/health` and an empty engine test passes |
+| 1. Auth and profile | Register, login, refresh, reset, delete, export | A user can sign in and call `/v1/me` |
+| 2. Catalogue read | Issuers and card search over seeded `live` rows entered by hand | Search by bank and by name returns the seed set |
+| 3. Portfolio | Add and remove cards | A user can save two cards from the same bank |
+| 4. Engine | Calculation module and golden tests | PRD worked example and cap/exclusion cases pass |
+| 5. Recommend API and result UI | End-to-end recommendation on hand-verified rules | p95 under 3 seconds on staging for a 5-card portfolio, explanation optional |
+| 6. Ingestion | Allowlisted fetch, hash change detection, draft rules | A changed fixture document produces `needs_review` rows and does not replace verified rows |
+| 7. Review and citations | Staff verify flow, source URL on each result, freshness label | A rule cannot reach the app without `verified` and a source URL |
+| 8. RAG assist | Chunking, embeddings, retrieval used by reviewers and explanation citations | A result can show the source sentence for the winning rule |
+
+Slices 0–5 are the user-facing MVP core. Slices 6–8 are the knowledge-base MVP from the PRD. Hand-verified seed rules in slice 2 let the app run before crawl is finished.
+
+---
+
+## 14. Testing
+
+| Layer | What |
+|---|---|
+| Engine unit tests | Base earn, category acceleration, merchant override, online vs offline, exclusion, threshold, cap clamp, points-to-paise, tie-break, empty portfolio |
+| Golden file | At least 50 cases with expected paise, including the two-card example in section 8.5. Target: 100% on this file before release, which is the practical stand-in for the PRD's 98% accuracy target |
+| Chunker tests | Heading split, paragraph split, token-window overlap of 120, table kept whole, table header repeated when a table is split, short chunk merged, PDF page boundary, `chunker_version` bump changes ids |
+| Retrieval tests | A chunk for card B is excluded when the filter is card A. Overlap twins collapse at cosine 0.95. Fusion ranks a passage that is both lexically and semantically close above a dense-only neighbour. A rule with stored quote offsets does not call the index. An audit miss forces `needs_review` |
+| API tests | Auth, portfolio uniqueness, recommendation validation, unknown merchant still returns a category-based result, explanation timeout still returns the ranked table |
+| Worker tests | Unchanged hash does not re-extract. Raw change with the same `text_hash` skips chunk and extract. A quote that is not a substring stays `needs_review`. A verified row survives a new draft |
+| Mobile | Detox or Maestro smoke: register, add card, recommend, read winner and source link |
+
+A calculation change bumps `engine_version` and must keep the golden file green or update expected values in the same change with a reviewer.
+
+---
+
+## 15. Observability
+
+- Request log on `POST /recommendations`: `recommendation_id`, `latency_ms` through the engine, `citation_ms`, `explanation_ms`, `citation_degraded`, card count, winner `card_product_id`, `engine_version`. No purchase narrative in logs beyond amount bucket (under ₹1k, ₹1k–₹10k, above ₹10k).
+- Worker metrics: fetches, hash changes, `text_unchanged` skips, chunks written, embed failures, extraction failures, rows waiting in `needs_review`.
+- Alert when a `live` card has `last_verified_at` older than 45 days, and when the review queue exceeds 20 rules.
+
+---
+
+## 16. What this plan leaves for later
+
+Phase 2 in the PRD (cap consumption over the month, milestones, user-set redemption values, spending insights) needs new tables for tracked spend and a user preference for `redemption_values`. The engine's cap step already takes a headroom number; Phase 2 replaces "full cap" with remaining headroom. Phase 3 natural-language queries sit in front of the same `POST /recommendations` contract once category and merchant can be parsed from a sentence. The ranker does not change.
