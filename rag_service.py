@@ -331,11 +331,13 @@ except Exception as e:
 # API Models & Endpoints
 # ---------------------------------------------------------------------------
 class IngestRequest(BaseModel):
-    document_id: str
-    card_name: str
-    issuer_id: str
-    raw_text: str
-    source_url: str
+    document_id: Optional[str] = None
+    card_name: Optional[str] = "General Bank Policy"
+    issuer_id: Optional[str] = "general"
+    raw_text: Optional[str] = None
+    text: Optional[str] = None
+    document: Optional[str] = None
+    source_url: Optional[str] = "https://cardwise.in"
     effective_date: Optional[str] = "2026-11-01"
 
 class RetrieveRequest(BaseModel):
@@ -402,16 +404,20 @@ def ingest(req: IngestRequest):
     1. Chunks with 800-token target and 120-token overlap.
     2. Embeds into ChromaDB with Hugging Face BAAI/bge-base-en-v1.5.
     """
+    content = req.raw_text or req.text or req.document or ""
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="Missing document text (raw_text, text, or document field required).")
+    doc_id = req.document_id or f"doc_{int(time.time())}"
     metadata = {
-        "document_id": req.document_id,
-        "card_name": req.card_name,
-        "issuer_id": req.issuer_id,
-        "source_url": req.source_url,
+        "document_id": doc_id,
+        "card_name": req.card_name or "General Bank Policy",
+        "issuer_id": req.issuer_id or "general",
+        "source_url": req.source_url or "https://cardwise.in",
         "effective_date": req.effective_date or ""
     }
-    chunks = clean_and_chunk_text(req.raw_text, target_tokens=800, overlap_tokens=120, metadata=metadata)
+    chunks = clean_and_chunk_text(content, target_tokens=800, overlap_tokens=120, metadata=metadata)
     
-    ids = [f"{req.document_id}_chunk_{i}" for i in range(len(chunks))]
+    ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
     texts = [c["text"] for c in chunks]
     metas = [{**metadata, "token_count": c["token_count"]} for c in chunks]
     
@@ -419,10 +425,62 @@ def ingest(req: IngestRequest):
     
     return {
         "success": True,
-        "document_id": req.document_id,
+        "document_id": doc_id,
         "chunks_indexed": len(ids),
         "chroma_total": vector_store.count()
     }
+
+@app.post("/ingest")
+def ingest_alias(req: IngestRequest):
+    """Alias for /documents/ingest."""
+    return ingest(req)
+
+class QueryRequest(BaseModel):
+    prompt: Optional[str] = Field(None, description="Natural language search prompt or transaction query")
+    query: Optional[str] = Field(None, description="Alternative alias for search prompt")
+    top_k: Optional[int] = Field(4, description="Number of most relevant passages to retrieve")
+    card_name: Optional[str] = Field(None, description="Filter passages by card name")
+    issuer_id: Optional[str] = Field(None, description="Filter passages by bank issuer (e.g. hdfc, sbi, axis)")
+
+@app.post("/query")
+def query_endpoint(req: QueryRequest):
+    """
+    Accepts a natural language prompt, performs semantic search over the ChromaDB vector store
+    at ./data/chroma using BAAI/bge-base-en-v1.5 embeddings, and returns the most relevant bank
+    policy passages to inform reward calculation logic.
+    """
+    search_prompt = req.prompt or req.query or ""
+    if not search_prompt.strip():
+        raise HTTPException(status_code=400, detail="Missing natural language prompt.")
+
+    start_time = time.time()
+    where_filter = None
+    if req.card_name and req.issuer_id:
+        where_filter = {"$and": [{"card_name": req.card_name}, {"issuer_id": req.issuer_id}]}
+    elif req.card_name:
+        where_filter = {"card_name": req.card_name}
+    elif req.issuer_id:
+        where_filter = {"issuer_id": req.issuer_id}
+
+    results = vector_store.query(search_prompt, top_k=req.top_k or 4, where_filter=where_filter)
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+
+    return {
+        "success": True,
+        "prompt": search_prompt,
+        "embedding_model": HUGGINGFACE_EMBEDDING_MODEL,
+        "chroma_path": CHROMA_PATH,
+        "passages": results,
+        "count": len(results),
+        "elapsed_ms": elapsed_ms,
+        "calculation_guidance": "Incorporate retrieved reward rates, monthly caps, and exclusions into the deterministic rupee benefit evaluation."
+    }
+
+@app.get("/query")
+def query_get(prompt: str, top_k: int = 4):
+    """GET query endpoint for fast browser testing."""
+    req = QueryRequest(prompt=prompt, top_k=top_k)
+    return query_endpoint(req)
 
 @app.post("/retrieve")
 def retrieve(req: RetrieveRequest):

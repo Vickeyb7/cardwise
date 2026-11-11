@@ -14,7 +14,7 @@ interface TactileCreditCardProps {
 
 export const TactileCreditCard: React.FC<TactileCreditCardProps> = ({
   card,
-  userName = 'PRIYA SHARMA',
+  userName = 'VALUED CARDHOLDER',
   isCompact = false,
   isSelected = false,
   onClick,
@@ -165,7 +165,7 @@ export const TactileCreditCard: React.FC<TactileCreditCardProps> = ({
             className="text-xs font-mono font-medium tracking-widest text-white/90 uppercase"
             style={{ textShadow: '0 1px 2px rgba(0,0,0,0.7)' }}
           >
-            {userName}
+            {userName && userName.trim() ? userName.toUpperCase() : 'VALUED CARDHOLDER'}
           </div>
           <div className="text-[10px] text-white/60 font-mono tracking-wider">
             VALID THRU 11/29

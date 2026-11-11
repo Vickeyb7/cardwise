@@ -147,7 +147,7 @@ export interface CardCalculationDetail {
 export interface RecommendationResponse {
   query: RecommendationRequest;
   timestamp: string;
-  recommendedCard: CardCalculationDetail;
+  recommendedCard?: CardCalculationDetail | null;
   rankedCards: CardCalculationDetail[];
   unownedOpportunities: CardCalculationDetail[];
   summaryNote: string;

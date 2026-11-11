@@ -16,6 +16,7 @@ import {
   Layers,
   ChevronRight,
   BarChart3,
+  CreditCard,
 } from 'lucide-react';
 
 interface PortfolioVaultProps {
@@ -26,6 +27,8 @@ interface PortfolioVaultProps {
   onNavigateToCatalog: () => void;
   userName: string;
   isDark?: boolean;
+  isGoogleUser?: boolean;
+  onOpenLogin?: () => void;
 }
 
 export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
@@ -36,9 +39,11 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
   onNavigateToCatalog,
   userName,
   isDark = false,
+  isGoogleUser = false,
+  onOpenLogin,
 }) => {
   const [selectedCardId, setSelectedCardId] = useState<string>(
-    ownedCardIds[0] || 'hdfc_infinia'
+    ownedCardIds[0] || ''
   );
 
   const ownedCards = allCards.filter((c) => ownedCardIds.includes(c.id));
@@ -48,12 +53,14 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
   const totalAnnualFee = ownedCards.reduce((acc, c) => acc + c.annualFee, 0);
   const totalCardsCount = ownedCards.length;
   // Estimated annualized value extracted by smart optimization
-  const estimatedAnnualValue = Math.max(12000, totalCardsCount * 9450);
+  const estimatedAnnualValue = totalCardsCount > 0 ? totalCardsCount * 9450 : 0;
 
   return (
     <div className="space-y-8 pb-12">
-      {/* Summary Card with Sparkline Chart: Annual Reward Growth Projection */}
-      <AnnualProjectionSparkline totalCardsCount={totalCardsCount} isDark={isDark} />
+      {/* Summary Card with Sparkline Chart: Annual Reward Growth Projection (shown only if cards exist) */}
+      {totalCardsCount > 0 && (
+        <AnnualProjectionSparkline totalCardsCount={totalCardsCount} isDark={isDark} />
+      )}
 
       {/* Portfolio Header & Summary Metrics */}
       <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-8 border border-white/20 dark:border-white/10 shadow-sm">
@@ -66,18 +73,31 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
               <span className="text-slate-500">Zero Sensitive Data Stored</span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight">
-              {userName}'s Credit Card Portfolio
+              {isGoogleUser && userName ? `${userName}'s Credit Card Portfolio` : 'Credit Card Portfolio'}
             </h1>
             <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-              Manage your card arsenal. Only card models and reward tier metadata are saved.
+              {isGoogleUser
+                ? 'Your cards are safely synced to your Google Account. Add or remove cards anytime.'
+                : 'Manage your card arsenal. Sign in with Google to sync your cards across devices.'}
             </p>
           </div>
 
-          <LiquidMetalButton
-            label="Add More Cards"
-            onClick={onNavigateToCatalog}
-            icon={<Plus className="w-4 h-4 text-emerald-400" />}
-          />
+          <div className="flex items-center gap-3">
+            {!isGoogleUser && onOpenLogin && (
+              <button
+                type="button"
+                onClick={onOpenLogin}
+                className="px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-bold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+              >
+                Sign in with Google
+              </button>
+            )}
+            <LiquidMetalButton
+              label="Add More Cards"
+              onClick={onNavigateToCatalog}
+              icon={<Plus className="w-4 h-4 text-emerald-400" />}
+            />
+          </div>
         </div>
 
         {/* 4-Stat Strip */}
@@ -126,38 +146,108 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
         </div>
       </div>
 
-      {/* Monthly Rewards Arbitrage Visualization (Recharts) */}
-      <RewardsArbitrageChart isDark={isDark} />
+      {/* Monthly Rewards Arbitrage Visualization (Recharts, shown only when cards exist) */}
+      {totalCardsCount > 0 && <RewardsArbitrageChart isDark={isDark} />}
 
-      {/* Main Vault Workspace: Left Stack + Right Active Card Details */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Left Column: Stack / List of Cards */}
-        <div className="lg:col-span-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Your Cards ({ownedCards.length})
+      {/* Main Vault Workspace: "Add your first card" onboarding when vault is empty, else regular card manager */}
+      {totalCardsCount === 0 ? (
+        <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-8 sm:p-12 border border-white/20 dark:border-white/10 shadow-sm space-y-8">
+          <div className="text-center max-w-xl mx-auto space-y-3">
+            <div className="w-16 h-16 rounded-2xl bg-indigo-50 dark:bg-emerald-950/40 text-indigo-600 dark:text-emerald-400 flex items-center justify-center mx-auto shadow-inner">
+              <CreditCard className="w-8 h-8" />
+            </div>
+            <h2 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight">
+              Add Your First Credit Card
             </h2>
-            <span className="text-xs text-slate-500">Tap to inspect rules</span>
+            <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+              Your personal vault has no cards added yet. CardWise never asks for card numbers or banking passwords. Simply select the cards you currently carry below to track reward rates, monthly caps, and fee milestones.
+            </p>
           </div>
 
-          {ownedCards.length === 0 ? (
-            <div className="p-8 text-center backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl border border-dashed border-white/20 dark:border-white/10 space-y-3">
-              <Layers className="w-8 h-8 mx-auto text-slate-400" />
-              <div className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-                No credit cards added yet
-              </div>
-              <p className="text-xs text-slate-500">
-                Search and add cards to start receiving optimal purchase recommendations.
-              </p>
+          <div className="max-w-4xl mx-auto">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Popular Indian Cards (Click to add):
+              </h3>
               <button
                 type="button"
                 onClick={onNavigateToCatalog}
-                className="px-4 py-2 rounded-xl bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 transition-colors cursor-pointer"
+                className="text-xs font-semibold text-indigo-600 dark:text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
               >
-                Browse Supported Cards
+                <span>Browse Full 100+ Card Directory</span>
+                <ChevronRight className="w-4 h-4" />
               </button>
             </div>
-          ) : (
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {allCards.slice(0, 9).map((card) => (
+                <div
+                  key={card.id}
+                  className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 hover:border-slate-300 dark:hover:border-slate-700 transition-all flex flex-col justify-between shadow-xs"
+                >
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                      <span>{card.bankName}</span>
+                      <span className="text-slate-500">₹{card.annualFee}/yr</span>
+                    </div>
+                    <div className="text-sm font-bold text-slate-900 dark:text-white mt-1">
+                      {card.name}
+                    </div>
+                    <div className="text-xs font-medium text-emerald-600 dark:text-emerald-400 mt-1 line-clamp-1">
+                      {card.baseRateDescription.split('(')[0].trim()}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onAddCard(card.id)}
+                    className="mt-4 w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-emerald-500 dark:hover:bg-emerald-400 text-white dark:text-slate-950 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add as First Card</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-8 pt-6 border-t border-slate-200/80 dark:border-slate-800 flex flex-wrap items-center justify-between gap-4">
+              <div className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                <span>Zero financial credentials stored. Public reward schedules only.</span>
+              </div>
+
+              <div className="flex items-center gap-3">
+                {!isGoogleUser && onOpenLogin && (
+                  <button
+                    type="button"
+                    onClick={onOpenLogin}
+                    className="px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-bold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                  >
+                    Sign in with Google to Sync
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={onNavigateToCatalog}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition-colors cursor-pointer"
+                >
+                  Search Full Catalog
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+          {/* Left Column: Stack / List of Cards */}
+          <div className="lg:col-span-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                Your Cards ({ownedCards.length})
+              </h2>
+              <span className="text-xs text-slate-500">Tap to inspect rules</span>
+            </div>
+
             <div className="space-y-3">
               {ownedCards.map((card) => {
                 const isSelected = activeCard?.id === card.id;
@@ -199,12 +289,11 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
                 );
               })}
             </div>
-          )}
-        </div>
+          </div>
 
-        {/* Right Column: Detailed Card Dossier & Milestones */}
-        {activeCard && (
-          <div className="lg:col-span-7 space-y-6">
+          {/* Right Column: Detailed Card Dossier */}
+          {activeCard && (
+            <div className="lg:col-span-7 space-y-6">
             {/* Visual Hero & Actions */}
             <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-8 border border-white/20 dark:border-white/10 shadow-sm space-y-6">
               <div className="flex flex-col sm:flex-row items-center justify-between gap-6">
@@ -341,6 +430,7 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
           </div>
         )}
       </div>
+      )}
     </div>
   );
 };

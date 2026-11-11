@@ -26,6 +26,8 @@ import {
   Eye,
   Info,
   BarChart3,
+  CreditCard,
+  Plus,
 } from 'lucide-react';
 
 interface RecommendationEngineProps {
@@ -34,6 +36,7 @@ interface RecommendationEngineProps {
   capsUsedMap: Record<string, number>;
   onNavigateToCatalog: () => void;
   onNavigateToPortfolio: () => void;
+  onAddCard?: (cardId: string) => void;
 }
 
 export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
@@ -42,14 +45,15 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
   capsUsedMap,
   onNavigateToCatalog,
   onNavigateToPortfolio,
+  onAddCard,
 }) => {
-  // Input state
-  const [amountStr, setAmountStr] = useState<string>('10000');
-  const [selectedMerchant, setSelectedMerchant] = useState<string>('Amazon India');
+  // Input state (starts clean with no preloaded merchant or arbitrary amount)
+  const [amountStr, setAmountStr] = useState<string>('');
+  const [selectedMerchant, setSelectedMerchant] = useState<string>('');
   const [merchantSearchQuery, setMerchantSearchQuery] = useState<string>('');
   const [selectedCategory, setSelectedCategory] = useState<SpendCategory>('online_shopping');
   const [transactionType, setTransactionType] = useState<TransactionType>('online');
-  const [showUnowned, setShowUnowned] = useState<boolean>(true);
+  const [showUnowned, setShowUnowned] = useState<boolean>(false);
   const [selectedResultCardId, setSelectedResultCardId] = useState<string | null>(null);
 
   // AI Assistant Drawer state
@@ -84,13 +88,15 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
   const rankedCards = recommendationResponse.rankedCards;
   const unownedOpps = recommendationResponse.unownedOpportunities;
 
-  // Selected detail card for step inspection
+  // Selected detail card for step inspection (strictly owned winner or manually selected card, never defaulting to random unowned cards)
   const inspectingCard = useMemo(() => {
-    if (!selectedResultCardId) return winner;
-    const foundOwned = rankedCards.find((c) => c.card.id === selectedResultCardId);
-    if (foundOwned) return foundOwned;
-    const foundUnowned = unownedOpps.find((c) => c.card.id === selectedResultCardId);
-    return foundUnowned || winner;
+    if (selectedResultCardId) {
+      const foundOwned = rankedCards.find((c) => c.card.id === selectedResultCardId);
+      if (foundOwned) return foundOwned;
+      const foundUnowned = unownedOpps.find((c) => c.card.id === selectedResultCardId);
+      if (foundUnowned) return foundUnowned;
+    }
+    return winner || null;
   }, [selectedResultCardId, winner, rankedCards, unownedOpps]);
 
   // AI Advisor query handler
@@ -286,8 +292,8 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
         </div>
       </div>
 
-      {/* WINNER RECOMMENDATION HERO SECTION */}
-      {winner && (
+      {/* WINNER RECOMMENDATION HERO SECTION OR ONBOARDING PROMPT */}
+      {winner ? (
         <div className="relative overflow-hidden bg-gradient-to-br from-slate-950 via-slate-900 to-[#0B192C] text-white rounded-2xl p-6 sm:p-8 shadow-xl border border-slate-800">
           {/* Subtle background glow */}
           <div className="absolute top-0 right-0 -mr-20 -mt-20 w-80 h-80 rounded-full bg-emerald-500/10 blur-3xl pointer-events-none" />
@@ -397,10 +403,97 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
             </div>
           </div>
         </div>
+      ) : ownedCardIds.length === 0 ? (
+        <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-8 border border-white/20 dark:border-white/10 shadow-sm space-y-6">
+          <div className="text-center max-w-xl mx-auto space-y-3">
+            <div className="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-emerald-950/40 text-indigo-600 dark:text-emerald-400 flex items-center justify-center mx-auto shadow-inner">
+              <CreditCard className="w-7 h-7" />
+            </div>
+            <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 dark:text-white">
+              Add Your First Card
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-500 leading-relaxed">
+              CardWise personalizes rewards for <strong>the cards you actually hold</strong>. We never ask for card numbers, CVVs, or passwords. Add your first card below or browse the full catalog to start optimizing your purchases.
+            </p>
+          </div>
+
+          {/* Quick-add popular cards list */}
+          <div className="max-w-4xl mx-auto">
+            <div className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3 text-center sm:text-left flex items-center justify-between">
+              <span>Select Your First Card:</span>
+              <button
+                type="button"
+                onClick={onNavigateToCatalog}
+                className="text-xs font-semibold text-indigo-600 dark:text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
+              >
+                <span>Browse All {cards.length} Cards</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {cards.slice(0, 9).map((card) => {
+                const isOwned = ownedCardIds.includes(card.id);
+                return (
+                  <div
+                    key={card.id}
+                    className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 hover:border-slate-300 dark:hover:border-slate-700 transition-all flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="text-[10px] font-semibold text-slate-400 uppercase">
+                        {card.bankName}
+                      </div>
+                      <div className="text-xs font-bold text-slate-900 dark:text-white">
+                        {card.name}
+                      </div>
+                      <div className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-1 line-clamp-1">
+                        {card.baseRateDescription.split('(')[0].trim()}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onAddCard && onAddCard(card.id)}
+                      className={`mt-3 w-full py-1.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                        isOwned
+                          ? 'bg-emerald-500 text-white'
+                          : 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200'
+                      }`}
+                    >
+                      {isOwned ? (
+                        <>
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Added to Vault</span>
+                        </>
+                      ) : (
+                        <>
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>Add as First Card</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-10 border border-white/20 dark:border-white/10 shadow-sm text-center space-y-3">
+          <div className="w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-emerald-950/40 text-indigo-600 dark:text-emerald-400 flex items-center justify-center mx-auto shadow-inner">
+            <Sparkles className="w-6 h-6" />
+          </div>
+          <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white">
+            Ready to Optimize Your Spend
+          </h2>
+          <p className="text-xs sm:text-sm text-slate-500 max-w-md mx-auto">
+            You have {ownedCardIds.length} card{ownedCardIds.length > 1 ? 's' : ''} saved in your vault. Enter your purchase amount and category above to find which card yields the highest return.
+          </p>
+        </div>
       )}
 
       {/* SIDE-BY-SIDE CARD COMPARISON TABLE */}
-      <div className="bg-white dark:bg-[#1a1b21] rounded-2xl p-6 sm:p-8 border border-slate-200 dark:border-slate-800 shadow-sm">
+      {ownedCardIds.length > 0 && (
+        <div className="bg-white dark:bg-[#1a1b21] rounded-2xl p-6 sm:p-8 border border-slate-200 dark:border-slate-800 shadow-sm">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-slate-100 dark:border-slate-800">
           <div>
             <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white tracking-tight">
@@ -449,11 +542,36 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
-              {rankedCards.map((item) => {
-                const isSelected = inspectingCard.card.id === item.card.id;
-                return (
-                  <tr
-                    key={item.card.id}
+              {rankedCards.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-10 px-4 text-center">
+                    <div className="max-w-md mx-auto space-y-3">
+                      <div className="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mx-auto text-slate-400">
+                        <CreditCard className="w-5 h-5" />
+                      </div>
+                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                        No cards in your personal vault yet
+                      </div>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        Add the credit cards you own to compare real-world cashback, reward multipliers, and spend caps.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={onNavigateToPortfolio}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-indigo-600 dark:bg-emerald-500 text-white dark:text-slate-950 shadow hover:opacity-90 transition-opacity"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add Cards to Vault
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ) : (
+                rankedCards.map((item) => {
+                  const isSelected = inspectingCard?.card?.id === item.card.id;
+                  return (
+                    <tr
+                      key={item.card.id}
                     onClick={() => setSelectedResultCardId(item.card.id)}
                     className={`transition-colors cursor-pointer ${
                       item.isOptimal
@@ -550,8 +668,9 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
                       </button>
                     </td>
                   </tr>
-                );
-              })}
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -582,8 +701,8 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {unownedOpps.slice(0, 3).map((item) => {
-                const isBetterThanWinner = item.netBenefitInr > winner.netBenefitInr;
-                const gain = item.netBenefitInr - winner.netBenefitInr;
+                const isBetterThanWinner = winner ? item.netBenefitInr > winner.netBenefitInr : false;
+                const gain = winner ? item.netBenefitInr - winner.netBenefitInr : item.netBenefitInr;
                 return (
                   <div
                     key={item.card.id}
@@ -638,9 +757,10 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
           </div>
         )}
       </div>
+      )}
 
       {/* DETAILED AUDIT INSPECTION MODAL / PANEL */}
-      {inspectingCard && (
+      {inspectingCard && ownedCardIds.length > 0 && (
         <div className="bg-slate-50 dark:bg-[#121318] rounded-2xl p-6 border border-slate-200 dark:border-slate-800">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">

@@ -208,6 +208,27 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ ownedCardIds, isDark =
     { id: 'grocery_supermarket', label: 'Grocery & Tech' },
   ];
 
+  if (ownedCardIds.length === 0) {
+    return (
+      <div className="space-y-8 pb-12">
+        <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-8 sm:p-12 border border-white/20 dark:border-white/10 shadow-sm text-center space-y-4 max-w-2xl mx-auto">
+          <div className="w-16 h-16 rounded-2xl bg-indigo-50 dark:bg-emerald-950/40 text-indigo-600 dark:text-emerald-400 flex items-center justify-center mx-auto shadow-inner">
+            <TrendingUp className="w-8 h-8" />
+          </div>
+          <h2 className="text-2xl font-extrabold text-slate-900 dark:text-white">
+            Historical Arbitrage Insights
+          </h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+            CardWise generates personalized 6-month points analytics based on the credit cards you hold. You have not added any cards to your vault yet.
+          </p>
+          <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/60 text-xs text-slate-600 dark:text-slate-300">
+            Add the credit cards you carry in <strong>My Vault</strong> to populate your reward trajectory and monthly point calculations.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-8 pb-12">
       {/* Header Banner */}
@@ -246,6 +267,15 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ ownedCardIds, isDark =
             </div>
           </div>
         </div>
+
+        {ownedCardIds.length === 0 && (
+          <div className="flex items-center gap-3 p-3.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200/60 dark:border-amber-800/40 text-amber-900 dark:text-amber-200 text-xs">
+            <Info className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span>
+              <strong>Personal Vault is Empty:</strong> You haven't added any cards yet. The chart below illustrates simulated 6-month benchmark arbitrage across typical Indian consumer spends. Add your cards in <strong>My Vault</strong> to personalize these metrics!
+            </span>
+          </div>
+        )}
 
         {/* 4 Summary Stat Tiles */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-2 border-t border-slate-100 dark:border-slate-800">

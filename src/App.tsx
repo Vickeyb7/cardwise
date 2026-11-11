@@ -31,38 +31,16 @@ export default function App() {
   const [isLoginOpen, setIsLoginOpen] = useState<boolean>(false);
   const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
 
-  // User profile state
-  const [userName, setUserName] = useState<string>(() => {
-    return localStorage.getItem('cardwise_user_name') || 'Guest User';
-  });
-  const [userEmail, setUserEmail] = useState<string>(() => {
-    return localStorage.getItem('cardwise_user_email') || '';
-  });
-  const [userPhoto, setUserPhoto] = useState<string | undefined>(() => {
-    return localStorage.getItem('cardwise_user_photo') || undefined;
-  });
+  // User profile state (starts empty for unauthenticated visitors)
+  const [userName, setUserName] = useState<string>('');
+  const [userEmail, setUserEmail] = useState<string>('');
+  const [userPhoto, setUserPhoto] = useState<string | undefined>(undefined);
 
-  // Owned credit cards state (default to 4 popular Indian cards for rich initial experience)
-  const [ownedCardIds, setOwnedCardIds] = useState<string[]>(() => {
-    try {
-      const saved = localStorage.getItem('cardwise_owned_cards');
-      if (saved) return JSON.parse(saved);
-    } catch (e) {
-      // fallback
-    }
-    return ['hdfc_infinia', 'sbi_cashback', 'axis_atlas', 'amazon_pay_icici'];
-  });
+  // Owned credit cards state: completely empty by default for new, unauthenticated visitors
+  const [ownedCardIds, setOwnedCardIds] = useState<string[]>([]);
 
-  // Tracked monthly cap usage (e.g. ₹1,200 already used out of ₹5,000 SBI Cashback cap)
-  const [capsUsedMap, setCapsUsedMap] = useState<Record<string, number>>(() => {
-    try {
-      const saved = localStorage.getItem('cardwise_caps_used');
-      if (saved) return JSON.parse(saved);
-    } catch (e) {
-      // fallback
-    }
-    return { sbi_cashback: 1250 };
-  });
+  // Tracked monthly cap usage: completely empty by default for new, unauthenticated visitors
+  const [capsUsedMap, setCapsUsedMap] = useState<Record<string, number>>({});
 
   // Apply dark mode class to root document element
   useEffect(() => {
@@ -126,6 +104,9 @@ export default function App() {
         });
       } else {
         setCurrentUser(null);
+        setUserName('');
+        setUserEmail('');
+        setUserPhoto(undefined);
         if (unsubscribeFirestore) {
           unsubscribeFirestore();
         }
@@ -205,10 +186,17 @@ export default function App() {
   const handleLogOut = async () => {
     try {
       await logOut();
-      setUserName('Guest User');
+      setCurrentUser(null);
+      setUserName('');
       setUserEmail('');
       setUserPhoto(undefined);
+      setOwnedCardIds([]);
+      setCapsUsedMap({});
+      localStorage.removeItem('cardwise_user_name');
+      localStorage.removeItem('cardwise_user_email');
       localStorage.removeItem('cardwise_user_photo');
+      localStorage.removeItem('cardwise_owned_cards');
+      localStorage.removeItem('cardwise_caps_used');
       setIsProfileOpen(false);
     } catch (e) {
       console.error('Logout error:', e);
@@ -241,6 +229,7 @@ export default function App() {
             capsUsedMap={capsUsedMap}
             onNavigateToCatalog={() => setActiveTab('catalog')}
             onNavigateToPortfolio={() => setActiveTab('portfolio')}
+            onAddCard={handleAddCard}
           />
         )}
 
@@ -253,6 +242,8 @@ export default function App() {
             onNavigateToCatalog={() => setActiveTab('catalog')}
             userName={userName}
             isDark={isDark}
+            isGoogleUser={!!currentUser}
+            onOpenLogin={() => setIsLoginOpen(true)}
           />
         )}
 

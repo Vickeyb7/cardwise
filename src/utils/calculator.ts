@@ -178,11 +178,9 @@ export function evaluateCardsForPurchase(
   ownedCardIds: string[],
   capsUsedMap: Record<string, number> = {}
 ): RecommendationResponse {
-  // If user has no cards added, fall back to checking all popular cards
-  const effectiveOwnedIds = ownedCardIds.length > 0 ? ownedCardIds : ['hdfc_infinia', 'sbi_cashback', 'axis_atlas', 'amazon_pay_icici'];
-
+  // Only evaluate cards the user actually owns; do not inject random cards
   const allEvaluations: CardCalculationDetail[] = INDIAN_CREDIT_CARDS.map((card) => {
-    const isOwned = effectiveOwnedIds.includes(card.id);
+    const isOwned = ownedCardIds.includes(card.id);
     const capUsed = capsUsedMap[card.id] || 0;
     return calculateCardBenefit(card, query, isOwned, capUsed);
   });
@@ -199,38 +197,49 @@ export function evaluateCardsForPurchase(
     return b.effectiveReturnPercent - a.effectiveReturnPercent;
   });
 
-  // Assign ranks
+  // Assign ranks for owned cards
   ownedEvaluations.forEach((item, index) => {
     item.rank = index + 1;
     item.isOptimal = index === 0;
   });
 
-  const winner = ownedEvaluations[0] || allEvaluations[0];
-
-  // Generate comparative rationale ("Why other cards were less beneficial")
-  ownedEvaluations.forEach((item) => {
-    if (!item.isOptimal) {
-      const diff = winner.netBenefitInr - item.netBenefitInr;
-      if (item.exclusionApplies) {
-        item.whyLessBeneficialReason = `Yields ₹0 due to bank category exclusion (${item.exclusionReason}).`;
-      } else if (item.capHit) {
-        item.whyLessBeneficialReason = `Exhausted monthly accelerated reward cap; yields ₹${diff.toFixed(2)} less than ${winner.card.name}.`;
-      } else if (winner.isAccelerated && !item.isAccelerated) {
-        item.whyLessBeneficialReason = `Does not have a partner promotion on this merchant/category, earning only base rate (₹${diff.toFixed(2)} lower yield).`;
-      } else {
-        item.whyLessBeneficialReason = `Lower effective return rate (${item.effectiveReturnPercent}% vs ${winner.effectiveReturnPercent}% on ${winner.card.name}), yielding ₹${diff.toFixed(2)} less.`;
-      }
-    }
-  });
-
   // Sort unowned evaluations as well for opportunity insights
-  unownedEvaluations.sort((a, b) => b.netBenefitInr - a.netBenefitInr);
+  unownedEvaluations.sort((a, b) => {
+    if (b.netBenefitInr !== a.netBenefitInr) {
+      return b.netBenefitInr - a.netBenefitInr;
+    }
+    return b.effectiveReturnPercent - a.effectiveReturnPercent;
+  });
   unownedEvaluations.forEach((item, idx) => {
     item.rank = idx + 1;
+    item.isOptimal = idx === 0;
   });
 
-  let summaryNote = `Recommended card: ${winner.card.name} yielding ₹${winner.netBenefitInr.toLocaleString('en-IN')} (${winner.effectiveReturnPercent}% net return).`;
-  if (winner.isAccelerated) {
+  const winner = ownedEvaluations[0] || null;
+
+  // Generate comparative rationale ("Why other cards were less beneficial") if winner exists
+  if (winner) {
+    ownedEvaluations.forEach((item) => {
+      if (!item.isOptimal) {
+        const diff = winner.netBenefitInr - item.netBenefitInr;
+        if (item.exclusionApplies) {
+          item.whyLessBeneficialReason = `Yields ₹0 due to bank category exclusion (${item.exclusionReason}).`;
+        } else if (item.capHit) {
+          item.whyLessBeneficialReason = `Exhausted monthly accelerated reward cap; yields ₹${diff.toFixed(2)} less than ${winner.card.name}.`;
+        } else if (winner.isAccelerated && !item.isAccelerated) {
+          item.whyLessBeneficialReason = `Does not have a partner promotion on this merchant/category, earning only base rate (₹${diff.toFixed(2)} lower yield).`;
+        } else {
+          item.whyLessBeneficialReason = `Lower effective return rate (${item.effectiveReturnPercent}% vs ${winner.effectiveReturnPercent}% on ${winner.card.name}), yielding ₹${diff.toFixed(2)} less.`;
+        }
+      }
+    });
+  }
+
+  let summaryNote = winner
+    ? `Recommended card: ${winner.card.name} yielding ₹${winner.netBenefitInr.toLocaleString('en-IN')} (${winner.effectiveReturnPercent}% net return).`
+    : `No credit cards added to your vault yet. Add your cards in My Vault to see personalized recommendations.`;
+
+  if (winner && winner.isAccelerated) {
     summaryNote += ` Benefited from accelerated partner rate: "${winner.applicableRuleDescription}".`;
   }
 
