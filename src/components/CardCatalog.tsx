@@ -38,8 +38,15 @@ export const CardCatalog: React.FC<CardCatalogProps> = ({
     { id: 'axis', label: 'Axis Bank' },
     { id: 'icici', label: 'ICICI Bank' },
     { id: 'amex', label: 'American Express' },
-    { id: 'standard_chartered', label: 'Standard Chartered' },
+    { id: 'hsbc', label: 'HSBC India' },
+    { id: 'federal', label: 'Federal / Scapia' },
+    { id: 'indusind', label: 'IndusInd Bank' },
+    { id: 'kotak', label: 'Kotak Mahindra' },
     { id: 'idfc', label: 'IDFC FIRST' },
+    { id: 'standard_chartered', label: 'Standard Chartered' },
+    { id: 'au', label: 'AU Small Finance' },
+    { id: 'rbl', label: 'RBL Bank' },
+    { id: 'yes', label: 'YES Bank' },
   ];
 
   const categoryOptions: { id: CardCategory | 'all'; label: string }[] = [
@@ -158,7 +165,7 @@ export const CardCatalog: React.FC<CardCatalogProps> = ({
               <div className="space-y-4">
                 {/* Tactile Card preview */}
                 <div
-                  className="cursor-pointer transition-transform hover:scale-[1.01]"
+                  className="cursor-pointer transition-all duration-300 hover:scale-[1.02] rounded-xl overflow-hidden shadow-sm hover:shadow-md"
                   onClick={() => setInspectingCard(card)}
                 >
                   <TactileCreditCard card={card} isCompact={true} />
@@ -255,9 +262,12 @@ export const CardCatalog: React.FC<CardCatalogProps> = ({
             </div>
 
             {/* Tactile Card */}
-            <div className="flex justify-center">
-              <div className="w-full max-w-[360px]">
-                <TactileCreditCard card={inspectingCard} />
+            <div className="flex justify-center my-2">
+              <div className="w-full max-w-[420px] relative group">
+                <div className="absolute -inset-2 bg-gradient-to-r from-indigo-500/10 via-emerald-500/10 to-amber-500/10 rounded-3xl blur-xl opacity-75 pointer-events-none" />
+                <div className="relative">
+                  <TactileCreditCard card={inspectingCard} />
+                </div>
               </div>
             </div>
 

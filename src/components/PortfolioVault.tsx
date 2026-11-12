@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { CreditCard as CreditCardType } from '../types.ts';
 import { TactileCreditCard } from './TactileCreditCard.tsx';
-import { RewardsArbitrageChart } from './RewardsArbitrageChart.tsx';
-import { AnnualProjectionSparkline } from './AnnualProjectionSparkline.tsx';
+import { VaultYieldSimulator } from './VaultYieldSimulator.tsx';
 import { LiquidMetalButton } from './ui/liquid-metal-button.tsx';
 import {
   Plus,
@@ -49,19 +48,16 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
   const ownedCards = allCards.filter((c) => ownedCardIds.includes(c.id));
   const activeCard = ownedCards.find((c) => c.id === selectedCardId) || ownedCards[0];
 
-  // Portfolio metrics
+  // Portfolio metrics computed strictly from owned cards
   const totalAnnualFee = ownedCards.reduce((acc, c) => acc + c.annualFee, 0);
   const totalCardsCount = ownedCards.length;
-  // Estimated annualized value extracted by smart optimization
-  const estimatedAnnualValue = totalCardsCount > 0 ? totalCardsCount * 9450 : 0;
+  const totalMilestonePotential = ownedCards.reduce(
+    (acc, c) => acc + (c.milestones || []).reduce((mSum, m) => mSum + m.monetaryValue, 0),
+    0
+  );
 
   return (
     <div className="space-y-8 pb-12">
-      {/* Summary Card with Sparkline Chart: Annual Reward Growth Projection (shown only if cards exist) */}
-      {totalCardsCount > 0 && (
-        <AnnualProjectionSparkline totalCardsCount={totalCardsCount} isDark={isDark} />
-      )}
-
       {/* Portfolio Header & Summary Metrics */}
       <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-8 border border-white/20 dark:border-white/10 shadow-sm">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 pb-6 border-b border-slate-100 dark:border-slate-800">
@@ -100,7 +96,7 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
           </div>
         </div>
 
-        {/* 4-Stat Strip */}
+        {/* 4-Stat Strip Grounded in User Cards */}
         <div className="mt-6 grid grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="p-4 rounded-xl backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border border-white/20 dark:border-white/10">
             <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
@@ -110,18 +106,6 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
               {totalCardsCount}
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">Across Indian Issuers</div>
-          </div>
-
-          <div className="p-4 rounded-xl backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border border-white/20 dark:border-white/10">
-            <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
-              Est. Annual Rewards Earned
-            </div>
-            <div className="text-2xl sm:text-3xl font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums font-sans mt-1">
-              ₹{estimatedAnnualValue.toLocaleString('en-IN')}
-            </div>
-            <div className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-0.5">
-              +₹4,200 vs standard debit card
-            </div>
           </div>
 
           <div className="p-4 rounded-xl backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border border-white/20 dark:border-white/10">
@@ -136,18 +120,30 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
 
           <div className="p-4 rounded-xl backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border border-white/20 dark:border-white/10">
             <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+              Max Milestone Potential
+            </div>
+            <div className="text-2xl sm:text-3xl font-extrabold text-amber-600 dark:text-amber-400 tabular-nums font-sans mt-1">
+              ₹{totalMilestonePotential.toLocaleString('en-IN')}
+            </div>
+            <div className="text-[11px] text-slate-500 mt-0.5">Across annual spend tiers</div>
+          </div>
+
+          <div className="p-4 rounded-xl backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border border-white/20 dark:border-white/10">
+            <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
               Policy Verification
             </div>
             <div className="text-2xl sm:text-3xl font-extrabold text-indigo-600 dark:text-emerald-400 tabular-nums font-sans mt-1">
               100%
             </div>
-            <div className="text-[11px] text-slate-500 mt-0.5">All official rules verified</div>
+            <div className="text-[11px] text-slate-500 mt-0.5">Official rules verified</div>
           </div>
         </div>
       </div>
 
-      {/* Monthly Rewards Arbitrage Visualization (Recharts, shown only when cards exist) */}
-      {totalCardsCount > 0 && <RewardsArbitrageChart isDark={isDark} />}
+      {/* Interactive Portfolio Yield Simulator (computed strictly from owned cards) */}
+      {totalCardsCount > 0 && (
+        <VaultYieldSimulator ownedCards={ownedCards} isDark={isDark} />
+      )}
 
       {/* Main Vault Workspace: "Add your first card" onboarding when vault is empty, else regular card manager */}
       {totalCardsCount === 0 ? (
@@ -183,18 +179,23 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
               {allCards.slice(0, 9).map((card) => (
                 <div
                   key={card.id}
-                  className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 hover:border-slate-300 dark:hover:border-slate-700 transition-all flex flex-col justify-between shadow-xs"
+                  className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 hover:border-slate-300 dark:hover:border-slate-700 transition-all flex flex-col justify-between shadow-xs group"
                 >
-                  <div>
-                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                      <span>{card.bankName}</span>
-                      <span className="text-slate-500">₹{card.annualFee}/yr</span>
+                  <div className="space-y-3">
+                    <div className="rounded-xl overflow-hidden shadow-sm group-hover:shadow-md transition-shadow">
+                      <TactileCreditCard card={card} isCompact={true} />
                     </div>
-                    <div className="text-sm font-bold text-slate-900 dark:text-white mt-1">
-                      {card.name}
-                    </div>
-                    <div className="text-xs font-medium text-emerald-600 dark:text-emerald-400 mt-1 line-clamp-1">
-                      {card.baseRateDescription.split('(')[0].trim()}
+                    <div>
+                      <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                        <span>{card.bankName}</span>
+                        <span className="text-slate-500">{card.annualFee === 0 ? 'Free' : `₹${card.annualFee}/yr`}</span>
+                      </div>
+                      <div className="text-sm font-bold text-slate-900 dark:text-white mt-0.5">
+                        {card.name}
+                      </div>
+                      <div className="text-xs font-medium text-emerald-600 dark:text-emerald-400 mt-1 line-clamp-1">
+                        {card.baseRateDescription.split('(')[0].trim()}
+                      </div>
                     </div>
                   </div>
 
@@ -261,8 +262,8 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
                         : 'backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 border-white/20 dark:border-white/10 hover:border-slate-300 dark:hover:border-slate-700'
                     }`}
                   >
-                    {/* Mini card thumbnail */}
-                    <div className="w-24 shrink-0">
+                    {/* Mini card thumbnail with high-res card art */}
+                    <div className="w-28 sm:w-32 shrink-0 rounded-xl overflow-hidden shadow-sm">
                       <TactileCreditCard card={card} isCompact={true} />
                     </div>
 
@@ -297,8 +298,11 @@ export const PortfolioVault: React.FC<PortfolioVaultProps> = ({
             {/* Visual Hero & Actions */}
             <div className="backdrop-blur-xl bg-white/70 dark:bg-[#121318]/70 rounded-2xl p-6 sm:p-8 border border-white/20 dark:border-white/10 shadow-sm space-y-6">
               <div className="flex flex-col sm:flex-row items-center justify-between gap-6">
-                <div className="w-full sm:w-auto max-w-[340px]">
-                  <TactileCreditCard card={activeCard} userName={userName} isSelected={true} />
+                <div className="w-full sm:w-auto max-w-[380px] relative group">
+                  <div className="absolute -inset-2 bg-gradient-to-r from-indigo-500/10 via-emerald-500/10 to-amber-500/10 rounded-3xl blur-xl opacity-75 group-hover:opacity-100 transition-opacity pointer-events-none" />
+                  <div className="relative">
+                    <TactileCreditCard card={activeCard} userName={userName} isSelected={true} />
+                  </div>
                 </div>
 
                 <div className="w-full sm:flex-1 space-y-3">

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { CreditCard as CreditCardType } from '../types.ts';
 import { ShieldCheck, Wifi } from 'lucide-react';
 
@@ -22,6 +22,8 @@ export const TactileCreditCard: React.FC<TactileCreditCardProps> = ({
   badgeText,
 }) => {
   const { visual } = card;
+  const [imgError, setImgError] = useState(false);
+  const cardArt = card.imageUrl || visual.cardArtUrl;
 
   // Network badge renderer
   const renderNetworkLogo = () => {
@@ -54,6 +56,71 @@ export const TactileCreditCard: React.FC<TactileCreditCardProps> = ({
     }
   };
 
+  // If high-resolution photographic card face is available and no load error, render realistic card image
+  if (cardArt && !imgError) {
+    if (isCompact) {
+      return (
+        <div
+          onClick={onClick}
+          role={onClick ? 'button' : undefined}
+          tabIndex={onClick ? 0 : undefined}
+          className={`relative w-full aspect-[1.586/1] rounded-xl overflow-hidden border transition-all duration-200 ${
+            isSelected
+              ? 'ring-2 ring-emerald-500 shadow-md scale-[1.02] border-emerald-400'
+              : 'hover:scale-[1.02] border-slate-700/60 hover:border-slate-500'
+          } cursor-pointer shadow-sm group bg-slate-900`}
+        >
+          <img
+            src={cardArt}
+            alt={card.name}
+            onError={() => setImgError(true)}
+            className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-300"
+          />
+          {/* Subtle gloss reflection overlay */}
+          <div className="absolute inset-0 bg-gradient-to-tr from-white/0 via-white/10 to-transparent pointer-events-none" />
+        </div>
+      );
+    }
+
+    return (
+      <div
+        onClick={onClick}
+        role={onClick ? 'button' : undefined}
+        tabIndex={onClick ? 0 : undefined}
+        className={`relative w-full aspect-[1.586/1] max-w-[420px] rounded-2xl overflow-hidden border transition-all duration-300 ${
+          isSelected
+            ? 'ring-2 ring-emerald-500 shadow-2xl scale-[1.02] border-emerald-400'
+            : 'shadow-xl hover:shadow-2xl border-slate-800'
+        } ${onClick ? 'cursor-pointer' : ''} select-none group bg-slate-950`}
+        style={{
+          boxShadow:
+            '0 20px 40px -12px rgba(11, 25, 44, 0.5), inset 0 1px 1px rgba(255, 255, 255, 0.3)',
+        }}
+      >
+        <img
+          src={cardArt}
+          alt={card.name}
+          onError={() => setImgError(true)}
+          className="w-full h-full object-cover object-center group-hover:scale-[1.02] transition-transform duration-500"
+        />
+
+        {/* Specular sheen overlay */}
+        <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-white/10 to-transparent pointer-events-none" />
+
+        {/* Optional Optimal Pick Badge */}
+        {showBadge && (
+          <div className="absolute top-3.5 right-3.5 z-10">
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold tracking-wide uppercase bg-emerald-500/90 text-white shadow-lg backdrop-blur-xs border border-emerald-300/40">
+              <ShieldCheck className="w-3 h-3 text-white" />
+              {badgeText || 'Optimal Pick'}
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Fallback: Tactile CSS physical shader representation
   if (isCompact) {
     return (
       <div

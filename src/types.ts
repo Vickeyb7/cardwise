@@ -7,7 +7,12 @@ export type BankId =
   | 'standard_chartered' 
   | 'idfc' 
   | 'indusind' 
-  | 'kotak';
+  | 'kotak'
+  | 'hsbc'
+  | 'au'
+  | 'rbl'
+  | 'federal'
+  | 'yes';
 
 export type CardCategory = 
   | 'cashback' 
@@ -40,6 +45,7 @@ export interface CardVisual {
   finish: 'titanium' | 'obsidian' | 'champagne' | 'emerald' | 'sapphire' | 'matte';
   chipColor: 'gold' | 'silver';
   network: 'visa' | 'mastercard' | 'amex' | 'rupay';
+  cardArtUrl?: string; // High-resolution photographic card face
 }
 
 export interface AcceleratedRule {
@@ -96,6 +102,7 @@ export interface CreditCard {
     verificationStatus: 'VERIFIED' | 'NEEDS_REVIEW';
   };
   visual: CardVisual;
+  imageUrl?: string;
 }
 
 export interface UserSavedCard {

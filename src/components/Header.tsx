@@ -1,6 +1,5 @@
 import React from 'react';
 import { Sparkles, CreditCard, TrendingUp, Layers, Radar, Sun, Moon, User } from 'lucide-react';
-import { LiquidMetalButton } from './ui/liquid-metal-button.tsx';
 import { LiquidNavbar, type LiquidNavItem } from './ui/liquid-glass-navbar.tsx';
 
 interface HeaderProps {
@@ -14,7 +13,7 @@ interface HeaderProps {
   isGoogleUser?: boolean;
   onOpenProfile: () => void;
   onOpenLogin: () => void;
-  onQuickRecommend: () => void;
+  onQuickRecommend?: () => void;
 }
 
 const NAV_TABS = ['recommend', 'portfolio', 'insights', 'catalog', 'knowledge'] as const;
@@ -135,14 +134,6 @@ export const Header: React.FC<HeaderProps> = ({
               </svg>
               <span className="hidden sm:inline">Sign in</span>
             </button>
-          )}
-
-          {/* Primary Action Button with Liquid Metal shader - only shown in optimizer section */}
-          {activeTab === 'recommend' && (
-            <LiquidMetalButton
-              label="Optimize ₹ Spend"
-              onClick={onQuickRecommend}
-            />
           )}
         </div>
       </div>

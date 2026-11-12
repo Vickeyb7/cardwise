@@ -165,9 +165,15 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
         <div className="mt-8 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           {/* Amount Input */}
           <div className="lg:col-span-5 space-y-2">
-            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-              Purchase Amount
-            </label>
+            <div className="flex items-center justify-between">
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                Purchase Amount
+              </label>
+              <span className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                Auto-calculated live
+              </span>
+            </div>
             <div className="relative rounded-xl shadow-xs">
               <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-500 dark:text-slate-400 font-bold text-lg">
                 ₹
@@ -584,7 +590,7 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
                     <td className="py-4 px-3">
                       <div className="flex items-center gap-2.5">
                         <span
-                          className={`w-6 h-6 rounded-full flex items-center justify-center font-bold text-xs ${
+                          className={`w-6 h-6 rounded-full flex items-center justify-center font-bold text-xs shrink-0 ${
                             item.isOptimal
                               ? 'bg-emerald-500 text-white'
                               : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300'
@@ -592,6 +598,13 @@ export const RecommendationEngine: React.FC<RecommendationEngineProps> = ({
                         >
                           #{item.rank}
                         </span>
+                        {item.card.imageUrl ? (
+                          <div className="w-10 h-6 rounded-md overflow-hidden shrink-0 border border-slate-300 dark:border-slate-700 shadow-2xs">
+                            <img src={item.card.imageUrl} alt={item.card.name} className="w-full h-full object-cover" />
+                          </div>
+                        ) : (
+                          <div className={`w-10 h-6 rounded-md shrink-0 bg-gradient-to-br ${item.card.visual.gradient} border border-white/20`} />
+                        )}
                         <div>
                           <div className="font-bold text-slate-900 dark:text-white">
                             {item.card.name}
